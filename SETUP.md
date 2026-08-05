@@ -1,83 +1,46 @@
-## 🚀 Setup Instructions
+## Setup Instructions
 
-This project lets you interact with GitHub (summarize repos, issues, PRs, etc.) via SMS using Twilio and OpenAI.
+Git SMS is a read-only proof of concept for summarizing public GitHub repositories and issues through an SMS webhook. Write operations remain intentionally disabled.
 
----
-
-### 1. Clone the Repo
+### Install
 
 ```bash
 git clone https://github.com/your-username/git-sms.git
 cd git-sms
-```
-
-### 2. Set Up Python Environment
-
-```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Create a `.env` File
+Tested on Python 3.10, 3.11, and 3.12.
 
-Create a file named `.env` in the project root and add your credentials:
+### Optional credentials
+
+Create `.env` when you want AI summaries:
 
 ```env
-
-# OpenAI
-OPENAI_API_KEY=your_openai_api_key
-
-# GitHub authentication (optional, read-only)
-# Only public read-only access is supported; write operations are disabled.
+GITHUB_OPENAI_API_KEY=your_github_models_token
+# OPENAI_API_KEY=your_openai_api_key
+# GITHUB_TOKEN=your_optional_read_only_token
 ```
 
----
+The application imports and starts without credentials. AI-dependent commands return a clear SMS response until a provider key is configured.
 
-### 4. Run the Server
+### Run
 
 ```bash
 uvicorn main:app --reload
 ```
 
-Your server will be available at: [http://127.0.0.1:8000](http://127.0.0.1:8000)
+Expose port 8000 and configure a Twilio incoming-message webhook to POST to `/webhook`.
 
----
+> This proof of concept does not validate Twilio signatures or authorize senders. Do not deploy it in production.
 
-### 5. Expose with ngrok
-
-In a separate terminal window:
-
-```bash
-ngrok http 8000
-```
-
-Copy the HTTPS URL it provides (e.g., `https://abc123.ngrok.io`).
-
----
-
-### 6. Configure Twilio Webhook
-
-1. Go to your [Twilio Console](https://console.twilio.com/)
-2. Navigate to your **Phone Number > Messaging > Webhook**
-3. Set the webhook URL to:
-
-```
-https://abc123.ngrok.io/webhook
-```
-
-4. Set the method to `POST`
-
----
-
-### ✅ Done
-
-Try texting your Twilio number with:
+### Commands
 
 ```text
 help
-summarize github/github
+summarize github/git-sms
+summarize owner/repo issue
 summarize owner/repo issue 123
 ```
-
-Let the bots do the rest.

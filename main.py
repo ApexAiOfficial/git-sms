@@ -1,209 +1,83 @@
+"""FastAPI webhook edge for Git SMS."""
+
+from __future__ import annotations
+
+import html
+import logging
+from typing import Annotated
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, Form
 from fastapi.responses import Response
-import requests, os, html
-from dotenv import load_dotenv
+
+from commands import create_issue, create_repo
 from natural_language_router import route_natural_command
-from azure.ai.inference import ChatCompletionsClient
-from azure.ai.inference.models import SystemMessage, UserMessage
-from azure.core.credentials import AzureKeyCredential
+from summarizers import summarize_any_repo, summarize_latest_issue, summarize_specific_issue
 
 load_dotenv()
-app = FastAPI()
+log = logging.getLogger(__name__)
+app = FastAPI(title="Git SMS", version="0.1.0")
 
-# Azure OpenAI configuration
-endpoint = "https://models.github.ai/inference"
-model_name = "openai/gpt-4o"
-token = os.getenv("GITHUB_OPENAI_API_KEY")
-
-client = ChatCompletionsClient(
-    endpoint=endpoint,
-    credential=AzureKeyCredential(token),
+HELP_TEXT = (
+    "Available commands:\n"
+    "- summarize owner/repo\n"
+    "- summarize owner/repo issue\n"
+    "- summarize owner/repo issue 123\n"
+    "Write commands remain disabled in this proof of concept."
 )
+SAFE_ERROR = "Something went wrong while processing that message. Please try again later."
 
-def ask_openai(prompt: str):
-    prompt += "\n\nLimit the summary to no more than 1,000 characters. Return plain text only. No formatting."
-    print("\n[ask_openai] Prompt being sent:\n", prompt)
 
-    try:
-        response = client.complete(
-            messages=[
-                SystemMessage("You are a helpful assistant."),
-                UserMessage(prompt),
-            ],
-            temperature=0.7,
-            top_p=1.0,
-            max_tokens=700,
-            model=model_name
-        )
-        if not response or not response.choices:
-            print("[ask_openai] No choices returned.")
-            return "Sorry, no summary was generated."
+def handle_message(*, sender: str, body: str) -> str:  # noqa: ARG001
+    """Handle one normalized inbound message and return reply text."""
+    text = body.strip()
+    parts = text.split()
+    lower = text.lower()
 
-        result = response.choices[0].message.content.strip()
-        print(f"[ask_openai] Response length: {len(result)}")
+    if lower == "help":
+        return HELP_TEXT
+    if lower.startswith("create repo") and len(parts) >= 3:
+        return create_repo(parts[2]).message
+    if lower.startswith("create issue") and len(parts) >= 4:
+        try:
+            pre, issue_body = text.split(" -- ", 1)
+            _, _, repo, *title_parts = pre.split()
+        except ValueError:
+            return "Usage: create issue <owner/repo> <title> -- <body>"
+        return create_issue(repo, " ".join(title_parts), issue_body).message
+    if lower.startswith("summarize") and len(parts) >= 2 and "/" in parts[1]:
+        repo = parts[1]
+        if len(parts) >= 4 and parts[2].lower() == "issue" and parts[3].isdigit():
+            return summarize_specific_issue(repo, int(parts[3]))
+        if len(parts) >= 3 and parts[2].lower() == "issue":
+            return summarize_latest_issue(repo)
+        return summarize_any_repo(repo)
 
-        if len(result) > 1000:
-            print("[ask_openai] Response too long.")
-            return "The summary was too long to send. Try summarizing a smaller repo or issue."
+    fallback = route_natural_command(text)
+    return fallback or "Unrecognized command. Text HELP for available commands."
 
-        return result
 
-    except Exception as e:
-        print("[ask_openai] Exception:", e)
-        return "AI summarization failed. Please try again later."
+def twilio_reply(message: str) -> Response:
+    """Return a valid TwiML message response."""
+    escaped = html.escape(message or "No content.")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        f"    <Message>{escaped}</Message>\n"
+        "</Response>"
+    )
+    return Response(content=xml, media_type="application/xml", status_code=200)
+
 
 @app.post("/webhook")
-async def sms_webhook(From: str = Form(...), Body: str = Form(...)):
-    text = Body.strip()
-    print(f"\n[webhook] Incoming from {From}: {text}")
-    parts = text.split()
-
-    if text.lower().startswith("create repo") and len(parts) >= 3:
-        repo_name = parts[2]
-        success = create_repo(repo_name)
-        return twilio_reply(f"Created repo '{repo_name}'" if success else f"Failed to create repo '{repo_name}'.")
-
-    if text.lower().startswith("create issue") and len(parts) >= 4:
-        try:
-            pre, body = text.split(" -- ", 1)
-            _, _, repo, *title_parts = pre.split()
-            title = " ".join(title_parts)
-            success = create_issue(repo, title, body)
-            return twilio_reply(f"Issue created in '{repo}'" if success else f"Failed to create issue in '{repo}'.")
-        except ValueError:
-            return twilio_reply("Usage: create issue <repo> <title> -- <body>")
-
-    if text.lower() == "help":
-        return twilio_reply(
-            "Available commands:\n"
-            "- summarize owner/repo\n"
-            "- summarize owner/repo issue [#]"
-        )
-
-    if text.lower().startswith("summarize") and len(parts) >= 2 and "/" in parts[1]:
-        owner_repo = parts[1]
-        if len(parts) >= 4 and parts[2].lower() == "issue" and parts[3].isdigit():
-            issue_number = int(parts[3])
-            summary = summarize_specific_issue(owner_repo, issue_number)
-            return twilio_reply(summary or "Could not summarize issue.")
-        elif len(parts) >= 3 and parts[2].lower() == "issue":
-            summary = summarize_latest_issue(owner_repo)
-            return twilio_reply(summary or "Could not summarize the latest issue.")
-        else:
-            summary = summarize_any_repo(owner_repo)
-            return twilio_reply(summary or "Could not summarize that repo.")
-
-    # 🔁 Fall back to natural language routing
-    print("[fallback] Attempting natural language parse")
-    fallback = route_natural_command(text)
-    if fallback:
-        return twilio_reply(fallback)
-
-    return twilio_reply("Unrecognized command. Text 'help' for available options.")
-
-def get_headers():
-    # Only read-only access with no authentication token
-    return {
-        "Accept": "application/vnd.github+json"
-    }
-
-def create_repo(name):
-    # Write operations are disabled in this prototype.
-    print("[create_repo] Disabled: write operations are disabled in this prototype.")
-    return False
-
-def create_issue(repo, title, body):
-    # Write operations are disabled in this prototype.
-    print("[create_issue] Disabled: write operations are disabled in this prototype.")
-    return False
-
-def summarize_any_repo(owner_repo):
+async def sms_webhook(
+    From: Annotated[str, Form()],  # noqa: N803
+    Body: Annotated[str, Form()],  # noqa: N803
+) -> Response:
+    """Translate Twilio form fields at the edge and always return useful TwiML."""
     try:
-        owner, repo = owner_repo.split("/")
-    except ValueError:
-        return "Invalid format. Use <owner>/<repo>"
-
-    readme_url = f"https://api.github.com/repos/{owner}/{repo}/readme"
-    repo_url = f"https://api.github.com/repos/{owner}/{repo}"
-    headers = {"Accept": "application/vnd.github+json"}
-
-    readme_res = requests.get(readme_url, headers=headers)
-    repo_res = requests.get(repo_url, headers=headers)
-
-    if not readme_res.ok or not repo_res.ok:
-        return None
-
-    try:
-        download_url = readme_res.json().get("download_url")
-        readme_content = requests.get(download_url).text if download_url else "No README found."
-        if len(readme_content) > 4000:
-            readme_content = readme_content[:4000]
-    except Exception as e:
-        print("[summarize_any_repo] Error downloading README:", e)
-        readme_content = "No README content available."
-
-    repo_data = repo_res.json()
-    prompt = f"""
-Summarize this GitHub repo:
-
-Repo Name: {repo_data.get('name') or 'Unknown'}
-Owner: {owner}
-Description: {repo_data.get('description') or 'No description'}
-Stars: {repo_data.get('stargazers_count', 0)}
-Forks: {repo_data.get('forks_count', 0)}
-Primary Language: {repo_data.get('language') or 'Unknown'}
-
-README:
-{readme_content}
-"""
-    return ask_openai(prompt)
-
-def summarize_latest_issue(owner_repo):
-    try:
-        owner, repo = owner_repo.split("/")
-    except ValueError:
-        return "Invalid format. Use <owner>/<repo>"
-
-    issues_url = f"https://api.github.com/repos/{owner}/{repo}/issues"
-    res = requests.get(issues_url, headers=get_headers(), params={"state": "open", "per_page": 1})
-    if not res.ok or not res.json():
-        print("[summarize_latest_issue] Issue fetch failed:", res.status_code)
-        return None
-
-    issue = res.json()[0]
-    return summarize_issue_thread(owner, repo, issue["number"])
-
-def summarize_specific_issue(owner_repo, issue_number):
-    try:
-        owner, repo = owner_repo.split("/")
-    except ValueError:
-        return "Invalid format. Use <owner>/<repo>"
-
-    return summarize_issue_thread(owner, repo, issue_number)
-
-def summarize_issue_thread(owner, repo, issue_number):
-    issue_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
-    comments_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
-    issue_res = requests.get(issue_url, headers=get_headers())
-    comments_res = requests.get(comments_url, headers=get_headers())
-
-    if not issue_res.ok or not comments_res.ok:
-        print("[summarize_issue_thread] Failed to fetch issue or comments.")
-        return None
-
-    issue = issue_res.json()
-    thread = f"Issue #{issue_number}: {issue.get('title')}\n{issue.get('body', '')}"
-    for comment in comments_res.json():
-        thread += "\n" + comment.get("body", "")
-
-    prompt = f"Summarize this GitHub issue thread:\n{thread}"
-    return ask_openai(prompt)
-
-def twilio_reply(message: str):
-    print("[twilio_reply] Responding with message:", message)
-    escaped = html.escape(message or "No content.")
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>{escaped}</Message>
-</Response>"""
-    return Response(content=xml, media_type="application/xml")
+        message = handle_message(sender=From, body=Body)
+    except Exception:
+        log.exception("Unexpected dispatch failure")
+        message = SAFE_ERROR
+    return twilio_reply(message)
