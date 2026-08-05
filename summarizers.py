@@ -175,6 +175,12 @@ def summarize_specific_issue(repo_full_name: str, issue_number: int) -> str:
         issue_response = requests.get(base, headers=get_headers(), timeout=REQUEST_TIMEOUT)
         if not issue_response.ok:
             return _error(issue_response, "issue")
+        issue = _json(issue_response)
+        if not isinstance(issue, dict):
+            return "GitHub returned an invalid issue response."
+        if "pull_request" in issue:
+            return f"#{issue_number} is a pull request, not an issue."
+
         comments_response = requests.get(
             f"{base}/comments",
             headers=get_headers(),
@@ -182,8 +188,8 @@ def summarize_specific_issue(repo_full_name: str, issue_number: int) -> str:
         )
         if not comments_response.ok:
             return _error(comments_response, "issue comments")
-        issue, comments = _json(issue_response), _json(comments_response)
-        if not isinstance(issue, dict) or not isinstance(comments, list):
+        comments = _json(comments_response)
+        if not isinstance(comments, list):
             return "GitHub returned an invalid issue response."
     except requests.Timeout:
         return "GitHub did not respond in time. Please try again."
