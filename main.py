@@ -47,8 +47,12 @@ def handle_message(*, sender: str, body: str) -> str:  # noqa: ARG001
         return create_issue(repo, " ".join(title_parts), issue_body).message
     if lower.startswith("summarize") and len(parts) >= 2 and "/" in parts[1]:
         repo = parts[1]
-        if len(parts) >= 4 and parts[2].lower() == "issue" and parts[3].isdigit():
-            return summarize_specific_issue(repo, int(parts[3]))
+        if len(parts) >= 4 and parts[2].lower() == "issue":
+            try:
+                issue_number = int(parts[3])
+            except ValueError:
+                return "Issue number must be a positive integer."
+            return summarize_specific_issue(repo, issue_number)
         if len(parts) >= 3 and parts[2].lower() == "issue":
             return summarize_latest_issue(repo)
         return summarize_any_repo(repo)

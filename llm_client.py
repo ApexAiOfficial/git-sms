@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
 from typing import Any
 
 
@@ -11,7 +10,6 @@ class LLMNotConfiguredError(RuntimeError):
     """Raised when no supported LLM credential is configured."""
 
 
-@lru_cache(maxsize=1)
 def get_llm_client() -> tuple[str, Any]:
     github_models_key = os.getenv("GITHUB_OPENAI_API_KEY")
     if github_models_key:
@@ -46,7 +44,10 @@ def complete_text(*, system_prompt: str, user_prompt: str, temperature: float, m
     else:
         response = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             temperature=temperature,
             max_tokens=max_tokens,
         )

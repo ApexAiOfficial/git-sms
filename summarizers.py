@@ -69,17 +69,24 @@ def _summarize(prompt: str) -> str:
     )
 
 
+def _bounded_prompt(prefix: str, content: str) -> str | None:
+    try:
+        available = max(0, MAX_TOKENS - num_tokens(prefix))
+        if num_tokens(content) > available:
+            content = truncate_text(content, available)
+    except Exception:
+        log.exception("Tokenizer failed")
+        return None
+    return prefix + content
+
+
 def summarize_any_repo(repo_full_name: str) -> str:
     if repo_full_name.count("/") != 1:
         return "Invalid format. Use <owner>/<repo>."
 
     repo_url = f"{GITHUB_API}/repos/{repo_full_name}"
     try:
-        repo_response = requests.get(
-            repo_url,
-            headers=get_headers(),
-            timeout=REQUEST_TIMEOUT,
-        )
+        repo_response = requests.get(repo_url, headers=get_headers(), timeout=REQUEST_TIMEOUT)
         if not repo_response.ok:
             return _error(repo_response, "repository")
         repo = _json(repo_response)
@@ -97,10 +104,7 @@ def summarize_any_repo(repo_full_name: str) -> str:
             encoded = readme.get("content") if isinstance(readme, dict) else None
             if encoded:
                 try:
-                    readme_text = base64.b64decode(encoded).decode(
-                        "utf-8",
-                        errors="ignore",
-                    )
+                    readme_text = base64.b64decode(encoded).decode("utf-8", errors="ignore")
                 except (ValueError, TypeError):
                     readme_text = "README content could not be decoded."
     except requests.Timeout:
@@ -120,14 +124,10 @@ def summarize_any_repo(repo_full_name: str) -> str:
         f"Primary Language: {repo.get('language') or 'Unknown'}\n\n"
         "README:\n"
     )
-    try:
-        available = MAX_TOKENS - num_tokens(prefix)
-        if num_tokens(readme_text) > available:
-            readme_text = truncate_text(readme_text, available)
-    except Exception:
-        log.exception("Tokenizer failed")
+    prompt = _bounded_prompt(prefix, readme_text)
+    if prompt is None:
         return "AI summarization is temporarily unavailable. Please try again later."
-    return _summarize(prefix + readme_text)
+    return _summarize(prompt)
 
 
 def summarize_latest_issue(repo_full_name: str) -> str:
@@ -152,16 +152,16 @@ def summarize_latest_issue(repo_full_name: str) -> str:
         return "Could not reach GitHub. Please try again later."
 
     issue = next(
-        (
-            item
-            for item in payload
-            if isinstance(item, dict) and "pull_request" not in item
-        ),
+        (item for item in payload if isinstance(item, dict) and "pull_request" not in item),
         None,
     )
     if not issue:
         return "No open issues found."
-    return summarize_specific_issue(repo_full_name, int(issue["number"]))
+    try:
+        issue_number = int(issue["number"])
+    except (KeyError, TypeError, ValueError):
+        return "GitHub returned an invalid issue response."
+    return summarize_specific_issue(repo_full_name, issue_number)
 
 
 def summarize_specific_issue(repo_full_name: str, issue_number: int) -> str:
@@ -172,11 +172,7 @@ def summarize_specific_issue(repo_full_name: str, issue_number: int) -> str:
 
     base = f"{GITHUB_API}/repos/{repo_full_name}/issues/{issue_number}"
     try:
-        issue_response = requests.get(
-            base,
-            headers=get_headers(),
-            timeout=REQUEST_TIMEOUT,
-        )
+        issue_response = requests.get(base, headers=get_headers(), timeout=REQUEST_TIMEOUT)
         if not issue_response.ok:
             return _error(issue_response, "issue")
         comments_response = requests.get(
@@ -203,6 +199,8 @@ def summarize_specific_issue(repo_full_name: str, issue_number: int) -> str:
         for comment in comments
         if isinstance(comment, dict)
     )
-    return _summarize(
-        "Summarize this GitHub issue thread:\n" + "\n".join(thread)
-    )
+    prefix = "Summarize this GitHub issue thread:\n"
+    prompt = _bounded_prompt(prefix, "\n".join(thread))
+    if prompt is None:
+        return "AI summarization is temporarily unavailable. Please try again later."
+    return _summarize(prompt)
