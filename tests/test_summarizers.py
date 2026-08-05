@@ -24,9 +24,7 @@ def test_latest_issue_skips_pull_requests(monkeypatch):
                 ]
             )
         if url.endswith("/issues/8"):
-            return FakeResponse(
-                {"number": 8, "title": "Real issue", "body": "body"}
-            )
+            return FakeResponse({"number": 8, "title": "Real issue", "body": "body"})
         if url.endswith("/issues/8/comments"):
             return FakeResponse([])
         raise AssertionError(url)
@@ -49,7 +47,32 @@ def test_repo_summary_without_llm_credentials_is_safe(monkeypatch):
     monkeypatch.setattr(summarizers.requests, "get", fake_get)
     monkeypatch.setattr(summarizers, "num_tokens", lambda _: 1)
     monkeypatch.setattr(summarizers, "complete_text", raise_not_configured)
-    assert (
-        summarizers.summarize_any_repo("owner/repo")
-        == summarizers.SUMMARY_NOT_CONFIGURED
-    )
+    assert summarizers.summarize_any_repo("owner/repo") == summarizers.SUMMARY_NOT_CONFIGURED
+
+
+def test_specific_issue_summary_truncates_large_thread(monkeypatch):
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/comments"):
+            return FakeResponse([{"body": "comment " * 100}])
+        return FakeResponse({"title": "Large issue", "body": "body " * 100})
+
+    class FakeEncoder:
+        def encode(self, text):
+            return list(text)
+
+        def decode(self, tokens):
+            return "".join(tokens)
+
+    def fake_complete_text(**kwargs):
+        captured["prompt"] = kwargs["user_prompt"]
+        return "summary"
+
+    monkeypatch.setattr(summarizers.requests, "get", fake_get)
+    monkeypatch.setattr(summarizers, "get_encoder", lambda: FakeEncoder())
+    monkeypatch.setattr(summarizers, "MAX_TOKENS", 80)
+    monkeypatch.setattr(summarizers, "complete_text", fake_complete_text)
+
+    assert summarizers.summarize_specific_issue("owner/repo", 4) == "summary"
+    assert len(captured["prompt"]) <= 80
