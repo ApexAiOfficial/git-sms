@@ -44,6 +44,28 @@ def test_latest_issue_skips_pull_requests(monkeypatch):
     assert any(url.endswith("/issues/8") for url in calls)
 
 
+def test_specific_issue_rejects_pull_request(monkeypatch):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return FakeResponse(
+            {
+                "number": 12,
+                "title": "This is actually a PR",
+                "pull_request": {"url": "https://api.github.com/example"},
+            }
+        )
+
+    monkeypatch.setattr(summarizers.requests, "get", fake_get)
+
+    assert (
+        summarizers.summarize_specific_issue("owner/repo", 12)
+        == "#12 is a pull request, not an issue."
+    )
+    assert not any(url.endswith("/comments") for url in calls)
+
+
 def test_repo_summary_without_llm_credentials_is_safe(monkeypatch):
     def fake_get(url, **kwargs):
         if url.endswith("/readme"):
