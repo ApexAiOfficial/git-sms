@@ -6,6 +6,11 @@ def test_headers_do_not_emit_bearer_none(monkeypatch):
     assert get_headers() == {"Accept": "application/vnd.github+json"}
 
 
+def test_headers_include_configured_token(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "example-token")
+    assert get_headers()["Authorization"] == "Bearer example-token"
+
+
 def test_disabled_write_outcomes_are_explicit():
     assert (
         create_repo("demo").message
