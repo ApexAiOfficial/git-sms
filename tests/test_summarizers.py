@@ -11,6 +11,14 @@ class FakeResponse:
         return self._payload
 
 
+class FakeEncoder:
+    def encode(self, text):
+        return list(text)
+
+    def decode(self, tokens):
+        return "".join(tokens)
+
+
 def test_latest_issue_skips_pull_requests(monkeypatch):
     calls = []
 
@@ -30,6 +38,7 @@ def test_latest_issue_skips_pull_requests(monkeypatch):
         raise AssertionError(url)
 
     monkeypatch.setattr(summarizers.requests, "get", fake_get)
+    monkeypatch.setattr(summarizers, "get_encoder", lambda: FakeEncoder())
     monkeypatch.setattr(summarizers, "complete_text", lambda **_: "summary")
     assert summarizers.summarize_latest_issue("owner/repo") == "summary"
     assert any(url.endswith("/issues/8") for url in calls)
@@ -57,13 +66,6 @@ def test_specific_issue_summary_truncates_large_thread(monkeypatch):
         if url.endswith("/comments"):
             return FakeResponse([{"body": "comment " * 100}])
         return FakeResponse({"title": "Large issue", "body": "body " * 100})
-
-    class FakeEncoder:
-        def encode(self, text):
-            return list(text)
-
-        def decode(self, tokens):
-            return "".join(tokens)
 
     def fake_complete_text(**kwargs):
         captured["prompt"] = kwargs["user_prompt"]
