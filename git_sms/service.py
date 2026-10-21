@@ -1,18 +1,24 @@
 """Turn one authenticated inbound SMS into GitHub calls and reply text.
 
-Order of checks for every message: opt-out keywords, opt-out state, sender directory,
-per-sender rate limit, parsing (optionally via the LLM), repository grant, and for
-writes a one-time confirmation code that only the real handset receives. Every
-decision lands in the audit log; phone numbers never leave this process.
+Order of checks for every message: Twilio opt-out signals and keywords, opt-out state,
+sender directory, per-sender rate limit, parsing (optionally via the LLM, within a
+global daily budget), repository grant, and for writes a one-time confirmation code
+that only the real handset receives. Every decision lands in the audit log.
+
+Writes are journalled before they are attempted, keyed to the MessageSid that
+triggered them, so a re-processed message can never repeat a write. A write whose
+outcome GitHub did not confirm (timeout, dropped connection, 5xx) is recorded as
+unknown and never retried automatically; it is reconciled by looking for the hidden
+marker the write carries.
 """
 
 from __future__ import annotations
 
-import hmac
 import logging
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 
 from git_sms.commands import (
     USAGE,
@@ -47,7 +53,7 @@ from git_sms.github import GitHub, GitHubError
 from git_sms.identity import Directory, User
 from git_sms.llm import LLM, LLMError
 from git_sms.sms import paginate
-from git_sms.store import Store
+from git_sms.store import Operation, Store
 
 log = logging.getLogger(__name__)
 
@@ -57,8 +63,13 @@ COMMANDS_TEXT = (
     "Text COMMANDS <name> for details."
 )
 NOT_UNDERSTOOD = "Not understood. Text COMMANDS for the list."
+AI_EXHAUSTED = "AI features have reached today's limit. Try REPO or ISSUE instead."
 MAX_CONFIRM_ATTEMPTS = 3
 EXCERPT = 280
+PAGES_TTL_SECONDS = 3600
+DUPLICATE_WINDOW_SECONDS = 86400
+RECONCILE_SLACK_SECONDS = 300
+OPT_OUT_TYPES = {"STOP": "opt_out", "START": "opt_in", "HELP": "help"}
 
 
 class Refusal(Exception):
@@ -72,6 +83,7 @@ class Inbound:
     recipient: str
     body: str
     num_media: int = 0
+    opt_out_type: str | None = None  # Twilio's OptOutType (Advanced Opt-Out), when present
 
 
 def _excerpt(text: str | None, limit: int = EXCERPT) -> str:
@@ -81,6 +93,16 @@ def _excerpt(text: str | None, limit: int = EXCERPT) -> str:
 
 def _label(ref: Ref) -> str:
     return f"{ref.repo}#{ref.number}"
+
+
+def _iso(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _target(command: Command) -> tuple[str, int | None]:
+    if isinstance(command, CreateIssue):
+        return command.repo, None
+    return command.ref.repo, command.ref.number
 
 
 class Service:
@@ -107,12 +129,21 @@ class Service:
     def handle(self, inbound: Inbound) -> list[str]:
         """Return the replies to send (usually one); an empty list means stay silent."""
         key = self.store.sender_key(inbound.sender)
-        command = parse(inbound.body)
+        audit_base = {"sender_key": key, "message_sid": inbound.message_sid}
 
+        twilio_kind = OPT_OUT_TYPES.get((inbound.opt_out_type or "").upper())
+        if twilio_kind:
+            # Advanced Opt-Out: Twilio has already acted and auto-replied; record, never answer twice.
+            if twilio_kind != "help":
+                self.store.set_opted_out(key, twilio_kind == "opt_out")
+            self.store.audit(**audit_base, action=f"twilio_{twilio_kind}", outcome="ok")
+            return []
+
+        command = parse(inbound.body)
         if isinstance(command, Keyword):
             if command.kind in {"opt_out", "opt_in"}:
                 self.store.set_opted_out(key, command.kind == "opt_out")
-                self.store.audit(sender_key=key, message_sid=inbound.message_sid, action=command.kind, outcome="ok")
+                self.store.audit(**audit_base, action=command.kind, outcome="ok")
                 return []
             command = Help()
         if self.store.is_opted_out(key):
@@ -120,20 +151,12 @@ class Service:
 
         user = self.directory.lookup(inbound.sender)
         if user is None:
-            self.store.audit(
-                sender_key=key, message_sid=inbound.message_sid, action="unknown_sender", outcome="ignored"
-            )
+            self.store.audit(**audit_base, action="unknown_sender", outcome="ignored")
             return []
 
         count = self.store.consume(f"commands:{key}", 3600)
         if count > self.settings.max_commands_per_hour:
-            self.store.audit(
-                sender_key=key,
-                message_sid=inbound.message_sid,
-                alias=user.alias,
-                action="rate_limit",
-                outcome="refused",
-            )
+            self.store.audit(**audit_base, alias=user.alias, action="rate_limit", outcome="refused")
             if count == self.settings.max_commands_per_hour + 1:
                 return ["Message limit reached for this hour. Try again later."]
             return []
@@ -144,11 +167,12 @@ class Service:
 
         interpreted = None
         if isinstance(command, Unknown):
-            command, interpreted = self._interpret(command)
+            command, interpreted = self._interpret(command, user)
 
-        audit = {"sender_key": key, "message_sid": inbound.message_sid, "alias": user.alias}
+        audit = {**audit_base, "alias": user.alias}
+        op_id = self.store.op_id(inbound.message_sid)
         try:
-            text = self._dispatch(command, user, key, interpreted, audit)
+            text = self._dispatch(command, user, key, interpreted, audit, op_id)
         except Refusal as refusal:
             text = str(refusal)
             self.store.audit(**audit, action=type(command).__name__, outcome="refused", detail=text)
@@ -167,11 +191,17 @@ class Service:
         if interpreted and not command.is_write:
             text = f"({interpreted})\n{text}"
         pages = paginate(text, self.settings.max_segments_per_reply)
-        self.store.set_pages(key, pages[1:])
+        self.store.set_pages(key, pages[1:], PAGES_TTL_SECONDS)
         return pages[:1]
 
-    def _interpret(self, command: Unknown) -> tuple[Command, str | None]:
-        if not (self.llm and self.settings.natural_language and command.text):
+    def _ai_allowed(self, user: User) -> bool:
+        """Guests never use the model; everyone else shares one global daily call budget."""
+        if user.guest or not self.llm:
+            return False
+        return self.store.consume("ai_calls:all", 86400) <= self.settings.max_ai_calls_per_day
+
+    def _interpret(self, command: Unknown, user: User) -> tuple[Command, str | None]:
+        if not (self.llm and self.settings.natural_language and command.text) or not self._ai_allowed(user):
             return command, None
         try:
             line = self.llm.interpret(command.text)
@@ -187,7 +217,9 @@ class Service:
 
     # Dispatch ------------------------------------------------------------------------
 
-    def _dispatch(self, command: Command, user: User, key: str, interpreted: str | None, audit: dict) -> str:
+    def _dispatch(
+        self, command: Command, user: User, key: str, interpreted: str | None, audit: dict, op_id: str
+    ) -> str:
         match command:
             case Unknown():
                 return NOT_UNDERSTOOD
@@ -204,7 +236,7 @@ class Service:
                     else ("Nothing is waiting for confirmation.")
                 )
             case Confirm(code):
-                return self._confirm(code, user, key, audit)
+                return self._confirm(code, user, key, audit, op_id)
             case Use(repo):
                 self._authorize_read(user, repo)
                 data = self._client(user).repo(repo)
@@ -213,12 +245,12 @@ class Service:
                 return f"Default repo is now {data.get('full_name') or repo}. Try ISSUES or ISSUE #1."
 
         if command.is_write:
-            return self._request_write(command, user, key, interpreted is not None, audit)
+            return self._request_write(command, user, key, interpreted is not None, audit, op_id)
 
         repo = self._repo_for(command, key)
         self._authorize_read(user, repo)
         client = self._client(user)
-        text = self._read(command, client, repo)
+        text = self._read(command, client, repo, user)
         self.store.audit(**audit, action=type(command).__name__, repo=repo, outcome="ok")
         return text
 
@@ -249,7 +281,7 @@ class Service:
 
     # Reads ---------------------------------------------------------------------------
 
-    def _read(self, command: Command, client: GitHub, repo: str | None) -> str:
+    def _read(self, command: Command, client: GitHub, repo: str | None, user: User) -> str:
         match command:
             case RepoInfo():
                 data = client.repo(repo)
@@ -317,7 +349,13 @@ class Service:
                 ]
                 return "\n".join(lines)
             case Search(query):
-                items = client.search_repositories(query)
+                # The service credential may see private repositories outside this sender's
+                # grants: filter before anything is formatted.
+                items = [
+                    item
+                    for item in client.search_repositories(query)
+                    if isinstance(item, dict) and user.can_read(str(item.get("full_name", "")))
+                ][:3]
                 if not items:
                     return "No repositories match."
                 return "\n".join(
@@ -325,12 +363,16 @@ class Service:
                     for n, item in enumerate(items, start=1)
                 )
             case Summarize():
-                return self._summarize(command, client, repo)
+                return self._summarize(command, client, repo, user)
         raise Refusal(NOT_UNDERSTOOD)
 
-    def _summarize(self, command: Summarize, client: GitHub, repo: str) -> str:
+    def _summarize(self, command: Summarize, client: GitHub, repo: str, user: User) -> str:
         if not self.llm:
             raise Refusal("AI summaries are not set up here. Try REPO or ISSUE instead.")
+        if user.guest:
+            raise Refusal("AI summaries are for registered users. Try REPO or ISSUE instead.")
+        if not self._ai_allowed(user):
+            raise Refusal(AI_EXHAUSTED)
         number = command.number
         if command.latest_issue:
             latest = client.issues(repo, "open", limit=1)
@@ -372,78 +414,150 @@ class Service:
         if not user.can_write(repo):
             raise Refusal(f"You can't change {repo}.")
 
-    def _describe(self, command: Command, user: User) -> str:
+    def _describe(self, command: Command) -> str:
         if isinstance(command, CreateIssue):
             return f'open an issue in {command.repo}: "{_excerpt(command.title, 80)}"'
         issue = self.github.issue(command.ref.repo, command.ref.number)
-        kind = "PR" if "pull_request" in issue else "issue"
+        is_pull = "pull_request" in issue
         title = _excerpt(issue.get("title"), 60)
         if isinstance(command, AddComment):
+            kind = "PR" if is_pull else "issue"
             return f'comment on {kind} {_label(command.ref)} "{title}": "{_excerpt(command.body, 80)}"'
+        if is_pull:
+            # Closing a PR needs the Pull requests permission and is a code-review decision; keep it on GitHub.
+            raise Refusal("CLOSE and REOPEN work on issues only. Manage pull requests on GitHub.")
         if command.state == issue.get("state"):
             raise Refusal(f"{_label(command.ref)} is already {command.state}.")
         verb = "close" if command.state == "closed" else "reopen"
-        return f'{verb} {kind} {_label(command.ref)} "{title}"'
+        return f'{verb} issue {_label(command.ref)} "{title}"'
 
-    def _request_write(self, command: Command, user: User, key: str, interpreted: bool, audit: dict) -> str:
+    def _fingerprint(self, command: Command) -> str:
+        return self.store.fingerprint(canonical(command))
+
+    def _duplicate_note(self, command: Command, key: str) -> str:
+        earlier = self.store.similar_operation(key, self._fingerprint(command), DUPLICATE_WINDOW_SECONDS)
+        if earlier is None:
+            return ""
+        when = datetime.fromtimestamp(earlier.created_at, UTC).strftime("%H:%M UTC")
+        if earlier.status == "done":
+            return f" Note: you already made this change at {when}: {earlier.url}."
+        return f" Note: an identical change at {when} has an unconfirmed outcome; check {self._link(earlier)} first."
+
+    def _request_write(self, command: Command, user: User, key: str, interpreted: bool, audit: dict, op_id: str) -> str:
         command = self._resolve(command, key)
-        repo = command.repo if isinstance(command, CreateIssue) else command.ref.repo
+        repo, _ = _target(command)
         self._authorize_write(user, repo)
         if self.store.peek(f"writes:{key}", 86400) >= self.settings.max_writes_per_day:
             raise Refusal("Daily change limit reached. Try again tomorrow.")
-        description = self._describe(command, user)
+        description = self._describe(command)
         action = type(command).__name__
 
         if not (self.settings.confirm_writes or interpreted):
-            return self._execute(command, user, key, audit)
+            return self._execute(command, user, key, audit, op_id)
 
-        replaced = self.store.get_pending(key) is not None
         code = self._new_code()
-        self.store.set_pending(key, code, to_record(command), self.settings.confirmation_ttl_seconds)
+        replaced = self.store.set_pending(key, code, to_record(command), self.settings.confirmation_ttl_seconds)
         self.store.audit(**audit, action=action, repo=repo, outcome="awaiting_confirmation")
         minutes = self.settings.confirmation_ttl_seconds // 60
         note = " (replaces your earlier request)" if replaced else ""
-        return f"Reply CONFIRM {code} within {minutes} min to {description}{note}. ABORT drops it."
+        return (
+            f"Reply CONFIRM {code} within {minutes} min to {description}{note}. ABORT drops it."
+            + self._duplicate_note(command, key)
+        )
 
-    def _confirm(self, code: str, user: User, key: str, audit: dict) -> str:
-        pending = self.store.get_pending(key)
-        if pending is None:
+    def _confirm(self, code: str, user: User, key: str, audit: dict, op_id: str) -> str:
+        existing = self.store.operation(op_id)
+        if existing is not None:
+            # This very CONFIRM was already acted on (we are re-processing it after a restart).
+            return self._settle(existing)
+        outcome, record = self.store.confirm_pending(key, code, MAX_CONFIRM_ATTEMPTS)
+        if outcome == "none":
             return "Nothing is waiting for confirmation."
-        if pending.expires_at < self.store.now():
-            self.store.drop_pending(key)
+        if outcome == "expired":
             self.store.audit(**audit, action="Confirm", outcome="expired")
             return "That request expired. Send it again."
-        if not hmac.compare_digest(pending.code, code):
-            attempts = self.store.fail_pending(key)
+        if outcome in {"wrong", "locked"}:
             self.store.audit(**audit, action="Confirm", outcome="wrong_code")
-            if attempts >= MAX_CONFIRM_ATTEMPTS:
-                self.store.drop_pending(key)
+            if outcome == "locked":
                 return "Wrong code too many times. The request was dropped."
             return "Wrong code. Check the latest code and try again."
-        taken = self.store.take_pending(key)
-        if taken is None or taken.code != pending.code:
-            return "Nothing is waiting for confirmation."
-        command = from_record(taken.command)
-        repo = command.repo if isinstance(command, CreateIssue) else command.ref.repo
-        self._authorize_write(user, repo)
-        return self._execute(command, user, key, audit)
+        command = from_record(record)
+        self._authorize_write(user, _target(command)[0])
+        return self._execute(command, user, key, audit, op_id)
 
-    def _execute(self, command: Command, user: User, key: str, audit: dict) -> str:
+    def _execute(self, command: Command, user: User, key: str, audit: dict, op_id: str) -> str:
+        repo, number = _target(command)
+        action = type(command).__name__ + (f":{command.state}" if isinstance(command, SetState) else "")
+        earlier = self.store.begin_operation(op_id, key, action, repo, number, self._fingerprint(command))
+        if earlier is not None:
+            return self._settle(earlier)
         if self.store.consume(f"writes:{key}", 86400) > self.settings.max_writes_per_day:
+            self.store.finish_operation(op_id, "failed")
             raise Refusal("Daily change limit reached. Try again tomorrow.")
-        footer = f"\n\n<sub>Sent by {user.alias} via Git SMS</sub>"
-        action = type(command).__name__
-        match command:
-            case CreateIssue(repo, title, body):
-                issue = self.github.create_issue(repo, title, (body + footer).strip())
-                self.store.audit(**audit, action=action, repo=repo, outcome="done", url=issue["html_url"])
-                return f"Created {repo}#{issue['number']}: {issue['html_url']}"
-            case AddComment(ref, body):
-                comment = self.github.add_comment(ref.repo, ref.number, body + footer)
-                self.store.audit(**audit, action=action, repo=ref.repo, outcome="done", url=comment["html_url"])
-                return f"Commented on {_label(ref)}: {comment['html_url']}"
-            case SetState(ref, state):
-                issue = self.github.set_state(ref.repo, ref.number, state)
-                self.store.audit(**audit, action=action, repo=ref.repo, outcome="done", url=issue["html_url"])
-                return f"{'Closed' if state == 'closed' else 'Reopened'} {_label(ref)}."
-        raise Refusal(NOT_UNDERSTOOD)
+
+        tail = f"\n\n<sub>Sent by {user.alias} via Git SMS</sub>\n<!-- git-sms:{op_id} -->"
+        try:
+            match command:
+                case CreateIssue(_, title, body):
+                    issue = self.github.create_issue(repo, title, (body + tail).strip())
+                    url, reply = issue["html_url"], f"Created {repo}#{issue['number']}: {issue['html_url']}"
+                case AddComment(ref, body):
+                    comment = self.github.add_comment(repo, number, body + tail)
+                    url, reply = comment["html_url"], f"Commented on {_label(ref)}: {comment['html_url']}"
+                case SetState(ref, state):
+                    issue = self.github.set_state(repo, number, state)
+                    url, reply = issue["html_url"], f"{'Closed' if state == 'closed' else 'Reopened'} {_label(ref)}."
+                case _:
+                    raise Refusal(NOT_UNDERSTOOD)
+        except GitHubError as error:
+            if not error.ambiguous:
+                self.store.finish_operation(op_id, "failed")
+                raise
+            self.store.finish_operation(op_id, "unknown")
+            self.store.audit(**audit, action=action, repo=repo, outcome="unknown", detail=str(error))
+            return self._unknown_reply(self.store.operation(op_id))
+        self.store.finish_operation(op_id, "done", url)
+        self.store.audit(**audit, action=action, repo=repo, outcome="done", url=url)
+        return reply
+
+    # Unknown outcomes ----------------------------------------------------------------
+
+    def _link(self, op: Operation) -> str:
+        return self.github.web_url(f"{op.repo}/issues" + (f"/{op.number}" if op.number else ""))
+
+    def _unknown_reply(self, op: Operation) -> str:
+        return f"GitHub did not confirm whether that change was made. Check {self._link(op)} before sending it again."
+
+    def _settle(self, op: Operation) -> str:
+        """Report on a write that already ran, reconciling it with GitHub if its outcome is open."""
+        if op.status == "done":
+            return f"Already done: {op.url}"
+        if op.status == "failed":
+            return "That change was not made."
+        url = self._reconcile(op)
+        if url:
+            self.store.finish_operation(op.op_id, "done", url)
+            return f"Done: {url}"
+        self.store.finish_operation(op.op_id, "unknown")
+        return self._unknown_reply(op)
+
+    def _reconcile(self, op: Operation) -> str | None:
+        """Find the write's hidden marker on GitHub; None means not found (which is not proof it failed)."""
+        marker = f"<!-- git-sms:{op.op_id} -->"
+        since = _iso(op.created_at - RECONCILE_SLACK_SECONDS)
+        try:
+            if op.action == "CreateIssue":
+                for issue in self.github.recent_issues(op.repo, since):
+                    if marker in (issue.get("body") or ""):
+                        return issue["html_url"]
+            elif op.action == "AddComment":
+                for comment in self.github.comments(op.repo, op.number, since=since):
+                    if marker in (comment.get("body") or ""):
+                        return comment["html_url"]
+            elif op.action.startswith("SetState:"):
+                issue = self.github.issue(op.repo, op.number)
+                if issue.get("state") == op.action.split(":", 1)[1]:
+                    return issue["html_url"]
+        except GitHubError as error:
+            log.warning("Reconciliation lookup failed: %s", error)
+        return None

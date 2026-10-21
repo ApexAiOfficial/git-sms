@@ -16,11 +16,17 @@ API_VERSION = "2022-11-28"
 
 
 class GitHubError(Exception):
-    """A failure whose message is safe to text back to the sender."""
+    """A failure whose message is safe to text back to the sender.
 
-    def __init__(self, message: str, status: int | None = None):
+    `ambiguous` is set when a write may have taken effect anyway (a timeout after the
+    request was sent, a dropped connection, a 5xx): such a write must never be retried
+    blindly.
+    """
+
+    def __init__(self, message: str, status: int | None = None, ambiguous: bool = False):
         super().__init__(message)
         self.status = status
+        self.ambiguous = ambiguous
 
 
 class TokenAuth:
@@ -122,6 +128,11 @@ class GitHub:
         timeout: float = 10.0,
     ):
         self._auth = auth
+        self._web = (
+            "https://github.com"
+            if api_url.rstrip("/") == "https://api.github.com"
+            else (api_url.rstrip("/").removesuffix("/api/v3"))
+        )
         self._client = httpx.Client(
             base_url=api_url,
             transport=transport,
@@ -132,6 +143,9 @@ class GitHub:
                 "User-Agent": f"git-sms/{__version__}",
             },
         )
+
+    def web_url(self, path: str) -> str:
+        return f"{self._web}/{path.lstrip('/')}"
 
     @property
     def authenticated(self) -> bool:
@@ -144,14 +158,19 @@ class GitHub:
         headers = {"Authorization": self._auth.authorization()} if self._auth else {}
         if raw:
             headers["Accept"] = "application/vnd.github.raw+json"
+        write = method != "GET"
         try:
             response = self._client.request(method, path, headers=headers, **kwargs)
-        except httpx.TimeoutException as exc:
-            raise GitHubError("GitHub did not respond in time. Try again.") from exc
-        except httpx.HTTPError as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
             raise GitHubError("Could not reach GitHub. Try again later.") from exc
+        except httpx.TimeoutException as exc:
+            raise GitHubError("GitHub did not respond in time.", ambiguous=write) from exc
+        except httpx.HTTPError as exc:
+            raise GitHubError("The connection to GitHub failed.", ambiguous=write) from exc
         if not response.is_success:
-            raise _error(response)
+            error = _error(response)
+            error.ambiguous = write and response.status_code >= 500
+            raise error
         if raw:
             return response.text
         try:
@@ -167,15 +186,52 @@ class GitHub:
     def readme(self, repo: str) -> str:
         return self._request("GET", f"/repos/{repo}/readme", raw=True)
 
-    def issues(self, repo: str, state: str = "open", limit: int = 5) -> list[dict]:
-        items = self._request("GET", f"/repos/{repo}/issues", params={"state": state, "per_page": 30})
-        return [item for item in items if "pull_request" not in item][:limit]
+    def issues(self, repo: str, state: str = "open", limit: int = 5, max_pages: int = 4) -> list[dict]:
+        """Newest issues, skipping pull requests (which the issues API interleaves) across bounded pages."""
+        found: list[dict] = []
+        for page in range(1, max_pages + 1):
+            items = self._request("GET", f"/repos/{repo}/issues", params={"state": state, "per_page": 50, "page": page})
+            found += [item for item in items if "pull_request" not in item]
+            if len(found) >= limit or len(items) < 50:
+                break
+        return found[:limit]
 
     def issue(self, repo: str, number: int) -> dict:
         return self._request("GET", f"/repos/{repo}/issues/{number}")
 
-    def comments(self, repo: str, number: int, limit: int = 30) -> list[dict]:
-        return self._request("GET", f"/repos/{repo}/issues/{number}/comments", params={"per_page": limit})
+    def comments(self, repo: str, number: int, max_pages: int = 3, since: str | None = None) -> list[dict]:
+        """Oldest-first comments, up to max_pages pages of 100."""
+        found: list[dict] = []
+        params: dict[str, Any] = {"per_page": 100}
+        if since:
+            params["since"] = since
+        for page in range(1, max_pages + 1):
+            items = self._request("GET", f"/repos/{repo}/issues/{number}/comments", params={**params, "page": page})
+            found += items
+            if len(items) < 100:
+                break
+        return found
+
+    def recent_issues(self, repo: str, since: str, max_pages: int = 3) -> list[dict]:
+        """Issues and PRs updated since an ISO time, for reconciling an unconfirmed write."""
+        found: list[dict] = []
+        for page in range(1, max_pages + 1):
+            items = self._request(
+                "GET",
+                f"/repos/{repo}/issues",
+                params={
+                    "state": "all",
+                    "since": since,
+                    "sort": "created",
+                    "direction": "desc",
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            found += items
+            if len(items) < 100:
+                break
+        return found
 
     def pulls(self, repo: str, limit: int = 5) -> list[dict]:
         return self._request("GET", f"/repos/{repo}/pulls", params={"state": "open", "per_page": limit})
@@ -183,9 +239,9 @@ class GitHub:
     def pull(self, repo: str, number: int) -> dict:
         return self._request("GET", f"/repos/{repo}/pulls/{number}")
 
-    def search_repositories(self, query: str, limit: int = 3) -> list[dict]:
-        payload = self._request("GET", "/search/repositories", params={"q": query, "per_page": limit})
-        return payload.get("items", [])[:limit]
+    def search_repositories(self, query: str, per_page: int = 30) -> list[dict]:
+        payload = self._request("GET", "/search/repositories", params={"q": query, "per_page": per_page})
+        return payload.get("items", [])
 
     # Writes ------------------------------------------------------------------------
 

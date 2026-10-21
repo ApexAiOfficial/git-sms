@@ -81,6 +81,10 @@ class FakeGitHubAPI:
         status, payload, headers = route
         if callable(payload):
             payload = payload(request)
+        if isinstance(payload, list) and "per_page" in request.url.params:
+            # Paginate like GitHub, so code that reads only the first page is caught.
+            per_page, page = int(request.url.params["per_page"]), int(request.url.params.get("page", 1))
+            payload = payload[(page - 1) * per_page : page * per_page]
         if isinstance(payload, str):
             return httpx.Response(status, text=payload, headers=headers)
         return httpx.Response(status, json=payload, headers=headers)
@@ -175,12 +179,18 @@ def api() -> FakeGitHubAPI:
 
 @pytest.fixture
 def make_service(api: FakeGitHubAPI, clock: Clock) -> Callable[..., Service]:
-    def make(llm: FakeLLM | None = None, public_read: bool = False, code: str = "4821", **overrides: Any) -> Service:
-        settings = Settings(environment="development", sender_backend="console", **overrides)
+    def make(
+        llm: FakeLLM | None = None,
+        public_read: bool = False,
+        code: str = "4821",
+        db_path: str = ":memory:",
+        **overrides,
+    ) -> Service:
+        settings = Settings(environment="development", sender_backend="console", db_path=db_path, **overrides)
         directory = Directory.from_toml(("public_read = true\n" if public_read else "") + USERS_TOML)
         return Service(
             settings,
-            Store(":memory:", "k" * 32, clock=clock),
+            Store(db_path, "k" * 32, clock=clock),
             directory,
             api.client(),
             guest_github=api.client(auth=None),
