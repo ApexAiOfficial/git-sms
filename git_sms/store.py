@@ -3,9 +3,10 @@ limits, confirmations, context, opt-outs and audit.
 
 Senders are identified by keyed hashes (HMAC-SHA256 with GIT_SMS_SECRET_KEY). What must
 be kept briefly in recoverable form (the queued message with its number, reply text,
-pending changes, MORE pages) is sealed with AES-GCM under a key derived from the same
-secret, and is deleted as soon as it is no longer needed. Nothing in the file reveals a
-phone number or message content without the secret, which never lives in the database.
+pending changes, approved-but-unattempted writes, MORE pages) is sealed with AES-GCM
+under a key derived from the same secret, and is deleted as soon as it is no longer
+needed. Nothing in the file reveals a phone number or message content without the
+secret, which never lives in the database.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from git_sms.config import ConfigError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA = """
 CREATE TABLE inbound (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,26 +43,35 @@ CREATE TABLE outbound (
     message_sid TEXT NOT NULL,
     sender_key TEXT NOT NULL,
     created_at REAL NOT NULL,
-    status TEXT NOT NULL,             -- pending, sending, accepted, failed, unknown, then Twilio's statuses
+    status TEXT NOT NULL,             -- our send lifecycle: pending, sending, accepted, failed, unknown
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL,
     segments INTEGER NOT NULL,
     provider_sid TEXT UNIQUE,
     error TEXT,
+    delivery TEXT,                    -- Twilio's delivery status from callbacks; only ever advances
     payload BLOB                      -- sealed; cleared once the provider accepted or refused it
 );
 CREATE INDEX outbound_status ON outbound (status, next_attempt_at);
+CREATE INDEX outbound_sender ON outbound (sender_key, status);
+CREATE TABLE delivery_events (        -- callbacks that arrived before the send recorded its SID
+    provider_sid TEXT PRIMARY KEY,
+    delivery TEXT NOT NULL,
+    error TEXT,
+    at REAL NOT NULL
+);
 CREATE TABLE operations (
-    op_id TEXT PRIMARY KEY,           -- derived from the MessageSid that triggered the write
+    op_id TEXT PRIMARY KEY,           -- derived from the MessageSid that approved the write
     sender_key TEXT NOT NULL,
     action TEXT NOT NULL,
     repo TEXT NOT NULL,
     number INTEGER,
     fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL,             -- executing, done, failed, unknown
+    status TEXT NOT NULL,             -- confirmed (approved, not attempted), executing, done, failed, unknown
     url TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    command BLOB                      -- sealed intent; cleared once an attempt starts
 );
 CREATE INDEX operations_fingerprint ON operations (sender_key, fingerprint);
 CREATE TABLE counters (
@@ -74,7 +84,11 @@ CREATE TABLE pending (
     code_mac TEXT NOT NULL,
     command BLOB NOT NULL,
     expires_at REAL NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    action TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    number INTEGER,
+    fingerprint TEXT NOT NULL
 );
 CREATE TABLE context (
     sender_key TEXT PRIMARY KEY,
@@ -99,7 +113,22 @@ CREATE TABLE audit (
     url TEXT
 );
 """
-TERMINAL_OUTBOUND = ("accepted", "failed", "unknown", "sent", "delivered", "undelivered", "read", "canceled")
+SETTLED_OUTBOUND = ("accepted", "failed", "unknown")
+# Twilio delivery statuses by progress: a callback may only move a message forward.
+DELIVERY_RANK = {
+    "accepted": 1,
+    "scheduled": 1,
+    "queued": 1,
+    "sending": 2,
+    "sent": 3,
+    "partially_delivered": 4,
+    "delivered": 5,
+    "undelivered": 5,
+    "failed": 5,
+    "canceled": 5,
+    "read": 6,
+}
+OPERATION_COLUMNS = "op_id, action, repo, number, status, url, created_at"
 
 
 @dataclass(frozen=True)
@@ -212,7 +241,7 @@ class Store:
         return self._mac("fingerprint", text)[:32]
 
     def op_id(self, message_sid: str) -> str:
-        """Public, unguessable id for the write a message triggered (embedded in GitHub bodies)."""
+        """Public, unguessable id for the write a message approved (embedded in GitHub bodies)."""
         return self._mac("op", message_sid)[:20]
 
     # Intake queue ------------------------------------------------------------------
@@ -267,6 +296,12 @@ class Store:
             row = self._db.execute("SELECT status FROM inbound WHERE message_sid = ?", (message_sid,)).fetchone()
         return row[0] if row else None
 
+    def queue_depth(self) -> int:
+        with self._lock:
+            return self._db.execute("SELECT count(*) FROM inbound WHERE status IN ('queued', 'processing')").fetchone()[
+                0
+            ]
+
     def recover(self) -> dict[str, int]:
         """After a restart: re-queue interrupted messages; never resend a reply whose send was in flight."""
         with self._transaction() as db:
@@ -280,10 +315,18 @@ class Store:
     # Outbound ledger ---------------------------------------------------------------
 
     def claim_outbound(self) -> OutboundMessage | None:
+        """The oldest ready reply whose sender has no earlier reply waiting or in flight.
+
+        One sender's replies are handed to Twilio one at a time, in the order they were
+        written (carriers still do not guarantee delivery order).
+        """
         with self._transaction() as db:
             row = db.execute(
-                "SELECT id, message_sid, sender_key, payload, segments, attempts FROM outbound "
-                "WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT 1",
+                "SELECT id, message_sid, sender_key, payload, segments, attempts FROM outbound o "
+                "WHERE status = 'pending' AND next_attempt_at <= ? AND NOT EXISTS ("
+                "  SELECT 1 FROM outbound p WHERE p.sender_key = o.sender_key AND p.id < o.id "
+                "  AND p.status IN ('pending', 'sending')"
+                ") ORDER BY id LIMIT 1",
                 (self._clock(),),
             ).fetchone()
             if not row:
@@ -295,9 +338,22 @@ class Store:
         self, message_id: int, status: str, *, provider_sid: str | None = None, error: str = ""
     ) -> None:
         with self._transaction() as db:
+            early = None
+            if provider_sid:
+                early = db.execute(
+                    "SELECT delivery, error FROM delivery_events WHERE provider_sid = ?", (provider_sid,)
+                ).fetchone()
+                db.execute("DELETE FROM delivery_events WHERE provider_sid = ?", (provider_sid,))
             db.execute(
-                "UPDATE outbound SET status = ?, provider_sid = ?, error = ?, payload = NULL WHERE id = ?",
-                (status, provider_sid, error[:200] or None, message_id),
+                "UPDATE outbound SET status = ?, provider_sid = ?, error = ?, delivery = ?, payload = NULL "
+                "WHERE id = ?",
+                (
+                    status,
+                    provider_sid,
+                    (early[1] if early and early[1] else error[:200]) or None,
+                    early[0] if early else None,
+                    message_id,
+                ),
             )
 
     def retry_outbound(self, message_id: int, delay_seconds: float, error: str) -> None:
@@ -307,67 +363,165 @@ class Store:
                 (self._clock() + delay_seconds, error[:200], message_id),
             )
 
-    def record_delivery(self, provider_sid: str, status: str, error_code: str | None) -> bool:
-        """Apply a Twilio status callback; False if the message is not one of ours."""
-        with self._transaction() as db:
-            return (
-                db.execute(
-                    "UPDATE outbound SET status = ?, error = coalesce(?, error) WHERE provider_sid = ?",
-                    (status, f"twilio {error_code}" if error_code else None, provider_sid),
-                ).rowcount
-                == 1
-            )
+    def record_delivery(self, provider_sid: str, delivery: str, error_code: str | None) -> str:
+        """Apply a Twilio status callback, only ever moving a message forward.
 
-    def outbound_for(self, message_sid: str) -> list[tuple[str, str | None, str | None, int]]:
+        Returns "applied", "stale" (an older or equal status arrived late), "early" (kept until
+        the send records its SID) or "ignored" (an unrecognised status). Callbacks may arrive
+        more than once and in any order.
+        """
+        rank = DELIVERY_RANK.get(delivery)
+        if rank is None:
+            return "ignored"
+        error = f"twilio {error_code}" if error_code else None
+        with self._transaction() as db:
+            row = db.execute("SELECT delivery FROM outbound WHERE provider_sid = ?", (provider_sid,)).fetchone()
+            if row is None:
+                early = db.execute(
+                    "SELECT delivery FROM delivery_events WHERE provider_sid = ?", (provider_sid,)
+                ).fetchone()
+                if early is None or DELIVERY_RANK.get(early[0], 0) < rank:
+                    db.execute(
+                        "INSERT OR REPLACE INTO delivery_events VALUES (?, ?, ?, ?)",
+                        (provider_sid, delivery, error, self._clock()),
+                    )
+                return "early"
+            if DELIVERY_RANK.get(row[0] or "", 0) >= rank:
+                return "stale"
+            db.execute(
+                "UPDATE outbound SET delivery = ?, error = coalesce(?, error) WHERE provider_sid = ?",
+                (delivery, error, provider_sid),
+            )
+            return "applied"
+
+    def outbound_for(self, message_sid: str) -> list[tuple[str, str | None, str | None, int, str | None]]:
+        """(status, provider_sid, error, attempts, delivery) for each reply to a message."""
         with self._lock:
             return self._db.execute(
-                "SELECT status, provider_sid, error, attempts FROM outbound WHERE message_sid = ? ORDER BY id",
+                "SELECT status, provider_sid, error, attempts, delivery FROM outbound "
+                "WHERE message_sid = ? ORDER BY id",
                 (message_sid,),
             ).fetchall()
 
     # Write journal -----------------------------------------------------------------
+    #
+    # confirmed ─start_operation─▶ executing ─▶ done | failed | unknown
+    # A confirmed intent has never touched GitHub and may be attempted once. Anything that
+    # reached executing is never attempted again; its outcome is settled or reconciled.
 
-    def begin_operation(
-        self, op_id: str, sender_key: str, action: str, repo: str, number: int | None, fingerprint: str
+    def record_intent(
+        self,
+        op_id: str,
+        sender_key: str,
+        action: str,
+        repo: str,
+        number: int | None,
+        fingerprint: str,
+        command: dict,
     ) -> Operation | None:
-        """Journal a write before it is attempted; returns the earlier record if this op already ran."""
+        """Durably record an approved write before any attempt; returns the earlier record if one exists."""
         now = self._clock()
         with self._transaction() as db:
             inserted = db.execute(
-                "INSERT OR IGNORE INTO operations VALUES (?, ?, ?, ?, ?, ?, 'executing', NULL, ?, ?)",
-                (op_id, sender_key, action, repo, number, fingerprint, now, now),
+                "INSERT OR IGNORE INTO operations VALUES (?, ?, ?, ?, ?, ?, 'confirmed', NULL, ?, ?, ?)",
+                (
+                    op_id,
+                    sender_key,
+                    action,
+                    repo,
+                    number,
+                    fingerprint,
+                    now,
+                    now,
+                    self._sealer.seal(command, sender_key),
+                ),
             ).rowcount
             if inserted:
                 return None
-            row = db.execute(
-                "SELECT op_id, action, repo, number, status, url, created_at FROM operations WHERE op_id = ?", (op_id,)
-            ).fetchone()
+            row = db.execute(f"SELECT {OPERATION_COLUMNS} FROM operations WHERE op_id = ?", (op_id,)).fetchone()  # noqa: S608
         return Operation(*row)
+
+    def intent(self, op_id: str) -> dict | None:
+        """The sealed command of a write that was approved but never attempted."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT sender_key, command FROM operations WHERE op_id = ? AND status = 'confirmed'", (op_id,)
+            ).fetchone()
+        return self._sealer.open(row[1], row[0]) if row and row[1] else None
+
+    def start_operation(self, op_id: str) -> bool:
+        """Move an intent to executing, exactly once; False if it was already attempted or settled."""
+        with self._transaction() as db:
+            return (
+                db.execute(
+                    "UPDATE operations SET status = 'executing', command = NULL, updated_at = ? "
+                    "WHERE op_id = ? AND status = 'confirmed'",
+                    (self._clock(), op_id),
+                ).rowcount
+                == 1
+            )
 
     def finish_operation(self, op_id: str, status: str, url: str | None = None) -> None:
         with self._transaction() as db:
             db.execute(
-                "UPDATE operations SET status = ?, url = coalesce(?, url), updated_at = ? WHERE op_id = ?",
+                "UPDATE operations SET status = ?, url = coalesce(?, url), command = NULL, updated_at = ? "
+                "WHERE op_id = ?",
                 (status, url, self._clock(), op_id),
             )
 
     def operation(self, op_id: str) -> Operation | None:
         with self._lock:
-            row = self._db.execute(
-                "SELECT op_id, action, repo, number, status, url, created_at FROM operations WHERE op_id = ?", (op_id,)
-            ).fetchone()
+            row = self._db.execute(f"SELECT {OPERATION_COLUMNS} FROM operations WHERE op_id = ?", (op_id,)).fetchone()  # noqa: S608
         return Operation(*row) if row else None
 
     def similar_operation(self, sender_key: str, fingerprint: str, within_seconds: float) -> Operation | None:
-        """The latest done or unresolved write with the same content, to warn before a duplicate."""
+        """The latest write with the same content that is done or not yet settled, to warn before a duplicate."""
         with self._lock:
             row = self._db.execute(
-                "SELECT op_id, action, repo, number, status, url, created_at FROM operations "
-                "WHERE sender_key = ? AND fingerprint = ? AND status IN ('done', 'unknown', 'executing') "
+                f"SELECT {OPERATION_COLUMNS} FROM operations "  # noqa: S608
+                "WHERE sender_key = ? AND fingerprint = ? AND status IN ('done', 'unknown', 'executing', 'confirmed') "
                 "AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
                 (sender_key, fingerprint, self._clock() - within_seconds),
             ).fetchone()
         return Operation(*row) if row else None
+
+    def unresolved_operations(self) -> list[Operation]:
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT {OPERATION_COLUMNS} FROM operations "  # noqa: S608
+                "WHERE status IN ('confirmed', 'executing', 'unknown') ORDER BY created_at"
+            ).fetchall()
+        return [Operation(*row) for row in rows]
+
+    # Health --------------------------------------------------------------------------
+
+    def health(self) -> dict[str, float | int]:
+        """Counts and ages an operator or a readiness probe needs; no identifiers."""
+        now = self._clock()
+        with self._lock:
+            inbound = self._db.execute(
+                "SELECT count(*), min(received_at) FROM inbound WHERE status IN ('queued', 'processing')"
+            ).fetchone()
+            replies = self._db.execute(
+                "SELECT count(*), min(created_at) FROM outbound WHERE status IN ('pending', 'sending')"
+            ).fetchone()
+            unknown_replies = self._db.execute("SELECT count(*) FROM outbound WHERE status = 'unknown'").fetchone()[0]
+            writes = dict(
+                self._db.execute(
+                    "SELECT status, count(*) FROM operations WHERE status IN ('confirmed', 'executing', 'unknown') "
+                    "GROUP BY status"
+                ).fetchall()
+            )
+        return {
+            "inbound_waiting": inbound[0],
+            "oldest_inbound_seconds": round(now - inbound[1], 1) if inbound[1] else 0,
+            "replies_waiting": replies[0],
+            "oldest_reply_seconds": round(now - replies[1], 1) if replies[1] else 0,
+            "replies_unknown": unknown_replies,
+            "writes_approved_unattempted": writes.get("confirmed", 0),
+            "writes_in_progress": writes.get("executing", 0),
+            "writes_unknown": writes.get("unknown", 0),
+        }
 
     # Fixed-window limits -------------------------------------------------------------
 
@@ -389,36 +543,55 @@ class Store:
 
     # Confirmations -------------------------------------------------------------------
 
-    def set_pending(self, sender_key: str, code: str, command: dict, ttl_seconds: int) -> bool:
-        """Store the change awaiting confirmation; True if it replaced an earlier one."""
+    def set_pending(
+        self,
+        sender_key: str,
+        code: str,
+        command: dict,
+        ttl_seconds: int,
+        *,
+        action: str,
+        repo: str,
+        number: int | None,
+        fingerprint: str,
+    ) -> bool:
+        """Store the change awaiting confirmation; True if it replaced an earlier, still-valid one."""
         with self._transaction() as db:
             replaced = db.execute(
                 "DELETE FROM pending WHERE sender_key = ? AND expires_at >= ?", (sender_key, self._clock())
             ).rowcount
             db.execute(
-                "INSERT OR REPLACE INTO pending VALUES (?, ?, ?, ?, 0)",
+                "INSERT OR REPLACE INTO pending VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
                 (
                     sender_key,
                     self._mac("code", sender_key, code),
                     self._sealer.seal(command, sender_key),
                     self._clock() + ttl_seconds,
+                    action,
+                    repo,
+                    number,
+                    fingerprint,
                 ),
             )
         return replaced == 1
 
-    def confirm_pending(self, sender_key: str, code: str, max_attempts: int) -> tuple[str, dict | None]:
-        """Atomically check and take the pending change.
+    def confirm_pending(self, sender_key: str, code: str, max_attempts: int, op_id: str) -> tuple[str, dict | None]:
+        """Atomically check the code and turn the pending change into a durable write intent.
 
-        Returns ("ok", command), ("none" | "expired" | "wrong" | "locked", None). A command
-        is returned at most once, and only for the code it was created with.
+        Returns ("ok", command), or ("none" | "expired" | "wrong" | "locked", None). The same
+        transaction that consumes the pending change journals it as operation op_id in state
+        "confirmed", so a crash at any later point leaves a recoverable intent, never a lost
+        one. A command is returned at most once, and only for the code it was created with.
         """
         with self._transaction() as db:
             row = db.execute(
-                "SELECT code_mac, command, expires_at, attempts FROM pending WHERE sender_key = ?", (sender_key,)
+                "SELECT code_mac, command, expires_at, attempts, action, repo, number, fingerprint "
+                "FROM pending WHERE sender_key = ?",
+                (sender_key,),
             ).fetchone()
             if row is None:
                 return "none", None
-            code_mac, sealed, expires_at, attempts = row
+            code_mac, sealed, expires_at, attempts, action, repo, number, fingerprint = row
             if expires_at < self._clock():
                 db.execute("DELETE FROM pending WHERE sender_key = ?", (sender_key,))
                 return "expired", None
@@ -428,6 +601,11 @@ class Store:
                     return "locked", None
                 db.execute("UPDATE pending SET attempts = attempts + 1 WHERE sender_key = ?", (sender_key,))
                 return "wrong", None
+            now = self._clock()
+            db.execute(
+                "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, 'confirmed', NULL, ?, ?, ?)",
+                (op_id, sender_key, action, repo, number, fingerprint, now, now, sealed),
+            )
             db.execute("DELETE FROM pending WHERE sender_key = ?", (sender_key,))
         return "ok", self._sealer.open(sealed, sender_key)
 
@@ -523,10 +701,9 @@ class Store:
     # Retention -----------------------------------------------------------------------
 
     def sweep(self, retention_days: int, audit_retention_days: int) -> dict[str, int]:
-        """Delete what is no longer needed. Unresolved writes are kept as long as the audit log."""
+        """Delete what is no longer needed. Unsettled writes are kept as long as the audit log."""
         now = self._clock()
         cutoff, audit_cutoff = now - retention_days * 86400, now - audit_retention_days * 86400
-        terminal = ",".join("?" * len(TERMINAL_OUTBOUND))
         with self._transaction() as db:
             counts = {
                 "pending": db.execute("DELETE FROM pending WHERE expires_at < ?", (now,)).rowcount,
@@ -537,9 +714,9 @@ class Store:
                     "DELETE FROM inbound WHERE status IN ('done', 'failed') AND received_at < ?", (cutoff,)
                 ).rowcount,
                 "outbound": db.execute(
-                    f"DELETE FROM outbound WHERE status IN ({terminal}) AND created_at < ?",  # noqa: S608
-                    (*TERMINAL_OUTBOUND, cutoff),
+                    "DELETE FROM outbound WHERE status IN (?, ?, ?) AND created_at < ?", (*SETTLED_OUTBOUND, cutoff)
                 ).rowcount,
+                "delivery_events": db.execute("DELETE FROM delivery_events WHERE at < ?", (now - 86400,)).rowcount,
                 "operations": db.execute(
                     "DELETE FROM operations WHERE (status IN ('done', 'failed') AND created_at < ?) OR created_at < ?",
                     (cutoff, audit_cutoff),

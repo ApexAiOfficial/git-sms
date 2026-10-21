@@ -73,7 +73,7 @@ def edge(make_service, tmp_path):
             twilio_auth_token=TOKEN,
             twilio_account_sid=ACCOUNT,
             db_path=str(tmp_path / "git-sms.db"),
-            **overrides,
+            **{k: v for k, v in overrides.items() if k != "public_read"},
         )
         service = make_service(db_path=str(tmp_path / "git-sms.db"), **overrides)
         return Edge(settings, service, sender or RecordingSender())
@@ -112,7 +112,7 @@ def test_signed_message_is_acknowledged_then_answered(edge):
     e.worker.drain()
     assert e.sender.sent == [(ALICE, OUR_NUMBER, "You are alice. Read: *. Write: acme/field-*. Default repo: none.")]
     assert e.service.store.inbound_status("SM" + "a" * 32) == "done"
-    assert e.service.store.outbound_for("SM" + "a" * 32) == [("accepted", "SMout1", None, 1)]
+    assert e.service.store.outbound_for("SM" + "a" * 32) == [("accepted", "SMout1", None, 1, None)]
 
 
 def test_original_webhook_path_still_works(edge):
@@ -256,7 +256,8 @@ def test_crash_mid_write_is_reconciled_from_the_hidden_marker(edge, api):
     job = e.service.store.claim_inbound()
     op_id = e.service.store.op_id(job.message_sid)
     # The journal says "executing" and GitHub has the issue, but the process died before it heard back.
-    e.service.store.begin_operation(op_id, job.sender_key, "CreateIssue", "acme/field-reports", None, "fp")
+    e.service.store.record_intent(op_id, job.sender_key, "CreateIssue", "acme/field-reports", None, "fp", {})
+    e.service.store.start_operation(op_id)
     marker_issue = {
         "number": 99,
         "html_url": "https://github.com/acme/field-reports/issues/99",
@@ -276,7 +277,8 @@ def test_crash_mid_write_without_evidence_is_reported_unknown_not_retried(edge, 
     e.post(form("confirm 4821", sid=sid(2)))
     job = e.service.store.claim_inbound()
     op_id = e.service.store.op_id(job.message_sid)
-    e.service.store.begin_operation(op_id, job.sender_key, "CreateIssue", "acme/field-reports", None, "fp")
+    e.service.store.record_intent(op_id, job.sender_key, "CreateIssue", "acme/field-reports", None, "fp", {})
+    e.service.store.start_operation(op_id)
     api.add("GET", "/repos/acme/field-reports/issues", [])
     fresh = e.restart()
     fresh.worker.store.recover()
@@ -354,7 +356,7 @@ def test_permanent_send_failures_are_recorded(edge):
     e = edge(sender=RecordingSender(errors=[SendError("twilio 400 21610")]))
     e.post(form("whoami", sid=sid(1)))
     e.worker.drain()
-    assert e.service.store.outbound_for(sid(1)) == [("failed", None, "twilio 400 21610", 1)]
+    assert e.service.store.outbound_for(sid(1)) == [("failed", None, "twilio 400 21610", 1, None)]
 
 
 def test_daily_segment_budget_stops_sending(edge):
@@ -374,7 +376,7 @@ def test_delivery_status_callbacks_are_verified_and_recorded(edge):
     callback = {"MessageSid": "SMout1", "MessageStatus": "undelivered", "ErrorCode": "30034", "AccountSid": ACCOUNT}
     assert e.post(callback, path="/twilio/status", signature="Zm9yZ2Vk").status_code == 403
     assert e.post(callback, path="/twilio/status").status_code == 204
-    assert e.service.store.outbound_for(sid(1)) == [("undelivered", "SMout1", "twilio 30034", 1)]
+    assert e.service.store.outbound_for(sid(1)) == [("accepted", "SMout1", "twilio 30034", 1, "undelivered")]
 
 
 def test_twilio_sends_ask_for_status_callbacks():
@@ -431,3 +433,164 @@ def _service(settings):
     from .conftest import USERS_TOML, standard_api
 
     return Service(settings, Store(":memory:", "k" * 32), Directory.from_toml(USERS_TOML), standard_api().client())
+
+
+# Second review ------------------------------------------------------------------------------
+
+
+class Crash(BaseException):
+    """Stands in for the process dying at an exact instruction."""
+
+
+def test_crash_between_confirmation_and_attempt_recovers_the_write(edge, api, monkeypatch):
+    """P1-01: the confirmed command survives a crash right after the pending change is consumed."""
+    e = edge()
+    e.text("new issue acme/field-reports Confirmed then crashed", sid(1))
+    e.post(form("confirm 4821", sid=sid(2)))
+
+    def die(op_id):
+        raise Crash
+
+    monkeypatch.setattr(e.service.store, "start_operation", die)
+    with pytest.raises(Crash):
+        e.worker.drain()
+    assert api.calls("POST") == []
+    fresh = e.restart()
+    fresh.worker.store.recover()
+    fresh.worker.drain()
+    assert api.calls("POST") == [ISSUES]
+    assert fresh.sender.sent[-1][2].startswith("Created acme/field-reports#99")
+    fresh.worker.store.recover()  # and a further re-run never writes again
+    assert fresh.service.handle(_inbound_for(fresh, sid(2), "confirm 4821")) == [
+        "Already done: https://github.com/acme/field-reports/issues/99"
+    ]
+    assert api.calls("POST") == [ISSUES]
+
+
+def test_crash_after_the_attempt_started_is_never_retried(edge, api, monkeypatch):
+    """The other side of P1-01: once an attempt may have reached GitHub, it is reconciled, not repeated."""
+    e = edge()
+    e.text("new issue acme/field-reports Maybe sent", sid(1))
+    e.post(form("confirm 4821", sid=sid(2)))
+
+    def die(*args, **kwargs):
+        raise Crash
+
+    monkeypatch.setattr(e.service.github, "create_issue", die)
+    with pytest.raises(Crash):
+        e.worker.drain()
+    api.add("GET", "/repos/acme/field-reports/issues", [])
+    fresh = e.restart()
+    fresh.worker.store.recover()
+    fresh.worker.drain()
+    assert api.calls("POST") == []
+    assert fresh.sender.sent[-1][2].startswith("GitHub did not confirm whether that change was made.")
+
+
+def test_revoked_grants_stop_a_recovered_intent(edge, api, monkeypatch):
+    e = edge()
+    e.text("new issue acme/field-reports Revoked meanwhile", sid(1))
+    e.post(form("confirm 4821", sid=sid(2)))
+    monkeypatch.setattr(e.service.store, "start_operation", lambda op_id: (_ for _ in ()).throw(Crash()))
+    with pytest.raises(Crash):
+        e.worker.drain()
+    fresh = e.restart()
+    from git_sms.identity import Directory
+
+    fresh.service.directory = Directory.from_toml('[[users]]\nphone = "' + ALICE + '"\nalias = "alice"\nread = ["*"]\n')
+    fresh.worker.store.recover()
+    fresh.worker.drain()
+    assert api.calls("POST") == []
+    assert fresh.sender.sent[-1][2] == "You can't change acme/field-reports."
+    assert fresh.service.store.operation(fresh.service.store.op_id(sid(2))).status == "failed"
+
+
+def test_replies_are_sent_before_more_inbound_is_processed(edge):
+    """P2-05: a ready reply (often a confirmation code) never waits behind other senders' messages."""
+    e = edge(public_read=True)
+    e.post(form("whoami", sid=sid(1)))
+    for n in range(20):
+        e.post(form("whoami", sid=sid(100 + n), sender=f"+155501003{n:02d}"))
+    e.worker.step()  # processes Alice's message
+    e.worker.step()  # sends her reply, ahead of 20 queued messages
+    assert [to for to, _, _ in e.sender.sent] == [ALICE]
+
+
+def test_unknown_senders_never_take_a_queue_slot(edge):
+    e = edge()
+    assert e.post(form("whoami", sid=sid(1), sender="+15550100009")).status_code == 200
+    assert e.service.store.inbound_status(sid(1)) is None
+    assert e.service.store.audit_log()[0].action == "unknown_sender"
+
+
+def test_a_full_queue_refuses_instead_of_acknowledging(edge):
+    e = edge(max_queued=2)
+    assert e.post(form("whoami", sid=sid(1))).status_code == 200
+    assert e.post(form("whoami", sid=sid(2))).status_code == 200
+    assert e.post(form("whoami", sid=sid(3))).status_code == 503
+    assert e.service.store.inbound_status(sid(3)) is None
+
+
+def test_readiness_reports_a_dead_worker_and_stalled_queues(make_service, tmp_path, clock):
+    settings = Settings(environment="development", sender_backend="console", allow_unsigned=True)
+    app = create_app(settings, service=make_service(), sender=RecordingSender(), start_worker=True)
+    cold = TestClient(app).get("/readyz")  # lifespan not run: the worker never started
+    assert cold.status_code == 503 and "worker not running" in cold.json()["problems"]
+    with TestClient(app) as running:
+        assert running.get("/readyz").status_code == 200
+    e = Edge(
+        Settings(environment="development", sender_backend="console", allow_unsigned=True),
+        make_service(),
+        RecordingSender(),
+    )
+    e.client.post("/twilio/sms", data=form("whoami", sid=sid(1)))
+    clock.advance(121)
+    stalled = e.client.get("/readyz")
+    assert stalled.status_code == 503 and "inbound queue stalled" in stalled.json()["problems"]
+    assert ALICE not in stalled.text
+
+
+class _FakeMessages:
+    def __init__(self, error):
+        self.error = error
+
+    def create(self, **kwargs):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("status", "retry", "ambiguous"),
+    [(429, True, False), (400, False, False), (500, False, True), (503, False, True)],
+)
+def test_twilio_rest_errors_map_to_safe_send_outcomes(status, retry, ambiguous):
+    """P1/P2-02: a 5xx (503 included) may hide an accepted message, so it must never be resent."""
+    from twilio.base.exceptions import TwilioRestException
+
+    from git_sms.app import TwilioSender
+
+    sender = TwilioSender(Settings(environment="development", twilio_account_sid=ACCOUNT, twilio_auth_token=TOKEN))
+    sender._client = type("C", (), {"messages": _FakeMessages(TwilioRestException(status, "uri", code=1))})()
+    with pytest.raises(SendError) as caught:
+        sender.send(to=ALICE, from_=OUR_NUMBER, body="hi")
+    assert (caught.value.retry, caught.value.ambiguous) == (retry, ambiguous)
+
+
+@pytest.mark.parametrize(
+    ("error", "retry", "ambiguous"), [("ConnectTimeout", True, False), ("ReadTimeout", False, True)]
+)
+def test_twilio_network_errors_map_to_safe_send_outcomes(error, retry, ambiguous):
+    import requests
+
+    from git_sms.app import TwilioSender
+
+    sender = TwilioSender(Settings(environment="development", twilio_account_sid=ACCOUNT, twilio_auth_token=TOKEN))
+    sender._client = type("C", (), {"messages": _FakeMessages(getattr(requests.exceptions, error)())})()
+    with pytest.raises(SendError) as caught:
+        sender.send(to=ALICE, from_=OUR_NUMBER, body="hi")
+    assert (caught.value.retry, caught.value.ambiguous) == (retry, ambiguous)
+
+
+def _inbound_for(edge_, message_sid, body):
+    from git_sms.service import Inbound
+
+    return Inbound(message_sid, ALICE, OUR_NUMBER, body)

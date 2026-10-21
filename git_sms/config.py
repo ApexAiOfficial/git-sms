@@ -86,6 +86,7 @@ class Settings:
     retention_days: int = 30
     audit_retention_days: int = 365
     workers: int = 4
+    max_queued: int = 500
 
     @property
     def is_development(self) -> bool:
@@ -156,6 +157,7 @@ class Settings:
             retention_days=_int(env, "GIT_SMS_RETENTION_DAYS", 30, minimum=1),
             audit_retention_days=_int(env, "GIT_SMS_AUDIT_RETENTION_DAYS", 365, minimum=1),
             workers=_int(env, "GIT_SMS_WORKERS", 4, minimum=1),
+            max_queued=_int(env, "GIT_SMS_MAX_QUEUED", 500, minimum=1),
         )
 
     def problems(self) -> list[str]:

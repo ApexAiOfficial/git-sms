@@ -6,9 +6,10 @@ Delivery policy, stated once:
   That is safe because every write is journalled against the message's MessageSid and
   never repeated; at worst a read is answered twice.
 - Each sender's messages are processed one at a time, in arrival order.
-- Replies are at-most-once once a send is in flight: a send that fails before Twilio
-  could have accepted it is retried (bounded) and its segments refunded; a send whose
-  fate is unknown (a timeout, a 5xx, an interrupted process) is never resent.
+- Replies are at-most-once once a send is in flight: a send that Twilio certainly did not
+  accept (429, or a connection that never opened) is retried, bounded, and its segments
+  refunded; a send whose fate is unknown (a timeout, any 5xx, an interrupted process) is
+  never resent. One sender's replies are handed to Twilio one at a time, in order.
 """
 
 from __future__ import annotations
@@ -99,15 +100,20 @@ class Worker:
                 log.info("Retention sweep removed %s", removed)
 
     def step(self) -> bool:
-        job = self.store.claim_inbound()
-        if job is not None:
-            self._process(job)
-            return True
+        # Replies first: a send is quick and bounded, and a waiting reply (often a confirmation
+        # code with a deadline) must not queue behind other senders' inbound work.
         message = self.store.claim_outbound()
         if message is not None:
             self._send(message)
             return True
+        job = self.store.claim_inbound()
+        if job is not None:
+            self._process(job)
+            return True
         return False
+
+    def alive(self) -> bool:
+        return bool(self._threads) and all(thread.is_alive() for thread in self._threads)
 
     # Inbound -------------------------------------------------------------------------
 

@@ -23,7 +23,7 @@ dependencies = [
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
-git-sms = "git_sms.__main__:main"
+git-sms = "git_sms.__main__:cli"
 
 [tool.setuptools.packages.find]
 include = ["git_sms*"]

@@ -443,21 +443,38 @@ class Service:
             return f" Note: you already made this change at {when}: {earlier.url}."
         return f" Note: an identical change at {when} has an unconfirmed outcome; check {self._link(earlier)} first."
 
+    def _action(self, command: Command) -> str:
+        return type(command).__name__ + (f":{command.state}" if isinstance(command, SetState) else "")
+
     def _request_write(self, command: Command, user: User, key: str, interpreted: bool, audit: dict, op_id: str) -> str:
         command = self._resolve(command, key)
-        repo, _ = _target(command)
+        repo, number = _target(command)
         self._authorize_write(user, repo)
         if self.store.peek(f"writes:{key}", 86400) >= self.settings.max_writes_per_day:
             raise Refusal("Daily change limit reached. Try again tomorrow.")
         description = self._describe(command)
-        action = type(command).__name__
 
         if not (self.settings.confirm_writes or interpreted):
-            return self._execute(command, user, key, audit, op_id)
+            # Development only (production refuses this setting): journal the intent, then attempt it.
+            earlier = self.store.record_intent(
+                op_id, key, self._action(command), repo, number, self._fingerprint(command), to_record(command)
+            )
+            if earlier is not None and earlier.status != "confirmed":
+                return self._settle(earlier)
+            return self._attempt(command, user, key, audit, op_id)
 
         code = self._new_code()
-        replaced = self.store.set_pending(key, code, to_record(command), self.settings.confirmation_ttl_seconds)
-        self.store.audit(**audit, action=action, repo=repo, outcome="awaiting_confirmation")
+        replaced = self.store.set_pending(
+            key,
+            code,
+            to_record(command),
+            self.settings.confirmation_ttl_seconds,
+            action=self._action(command),
+            repo=repo,
+            number=number,
+            fingerprint=self._fingerprint(command),
+        )
+        self.store.audit(**audit, action=type(command).__name__, repo=repo, outcome="awaiting_confirmation")
         minutes = self.settings.confirmation_ttl_seconds // 60
         note = " (replaces your earlier request)" if replaced else ""
         return (
@@ -468,9 +485,13 @@ class Service:
     def _confirm(self, code: str, user: User, key: str, audit: dict, op_id: str) -> str:
         existing = self.store.operation(op_id)
         if existing is not None:
-            # This very CONFIRM was already acted on (we are re-processing it after a restart).
+            # This very CONFIRM was acted on before (we are re-processing it after a restart).
+            if existing.status == "confirmed":
+                record = self.store.intent(op_id)
+                if record is not None:
+                    return self._attempt(from_record(record), user, key, audit, op_id)
             return self._settle(existing)
-        outcome, record = self.store.confirm_pending(key, code, MAX_CONFIRM_ATTEMPTS)
+        outcome, record = self.store.confirm_pending(key, code, MAX_CONFIRM_ATTEMPTS, op_id)
         if outcome == "none":
             return "Nothing is waiting for confirmation."
         if outcome == "expired":
@@ -481,16 +502,19 @@ class Service:
             if outcome == "locked":
                 return "Wrong code too many times. The request was dropped."
             return "Wrong code. Check the latest code and try again."
-        command = from_record(record)
-        self._authorize_write(user, _target(command)[0])
-        return self._execute(command, user, key, audit, op_id)
+        return self._attempt(from_record(record), user, key, audit, op_id)
 
-    def _execute(self, command: Command, user: User, key: str, audit: dict, op_id: str) -> str:
+    def _attempt(self, command: Command, user: User, key: str, audit: dict, op_id: str) -> str:
+        """Attempt a journalled intent at most once."""
         repo, number = _target(command)
-        action = type(command).__name__ + (f":{command.state}" if isinstance(command, SetState) else "")
-        earlier = self.store.begin_operation(op_id, key, action, repo, number, self._fingerprint(command))
-        if earlier is not None:
-            return self._settle(earlier)
+        action = self._action(command)
+        try:
+            self._authorize_write(user, repo)  # grants may have changed since the request
+        except Refusal:
+            self.store.finish_operation(op_id, "failed")
+            raise
+        if not self.store.start_operation(op_id):
+            return self._settle(self.store.operation(op_id))
         if self.store.consume(f"writes:{key}", 86400) > self.settings.max_writes_per_day:
             self.store.finish_operation(op_id, "failed")
             raise Refusal("Daily change limit reached. Try again tomorrow.")
@@ -529,35 +553,65 @@ class Service:
         return f"GitHub did not confirm whether that change was made. Check {self._link(op)} before sending it again."
 
     def _settle(self, op: Operation) -> str:
-        """Report on a write that already ran, reconciling it with GitHub if its outcome is open."""
+        """Report on a write that was already attempted, reconciling it with GitHub if its outcome is open."""
         if op.status == "done":
             return f"Already done: {op.url}"
         if op.status == "failed":
             return "That change was not made."
-        url = self._reconcile(op)
-        if url:
-            self.store.finish_operation(op.op_id, "done", url)
+        found = self.reconcile(op)
+        if found is None:
+            self.store.finish_operation(op.op_id, "unknown")
+            return self._unknown_reply(op)
+        url, proven = found
+        if proven:
             return f"Done: {url}"
-        self.store.finish_operation(op.op_id, "unknown")
-        return self._unknown_reply(op)
+        state = op.action.split(":", 1)[1]
+        return f"{op.repo}#{op.number} is {state} now, but GitHub did not confirm whether this request did it: {url}"
 
-    def _reconcile(self, op: Operation) -> str | None:
-        """Find the write's hidden marker on GitHub; None means not found (which is not proof it failed)."""
+    def reconcile(self, op: Operation) -> tuple[str, bool] | None:
+        """Look for an unsettled write on GitHub; settle it if found.
+
+        Returns (url, proven) or None when nothing was found, which is not proof the write failed.
+        Issues and comments carry this operation's hidden marker, so finding it is proof. A state
+        change carries no marker: the issue being in the target state is only evidence (someone
+        else may have changed it), so the operation is settled as done but reported as unproven.
+        """
         marker = f"<!-- git-sms:{op.op_id} -->"
         since = _iso(op.created_at - RECONCILE_SLACK_SECONDS)
+        found: tuple[str, bool] | None = None
         try:
             if op.action == "CreateIssue":
-                for issue in self.github.recent_issues(op.repo, since):
-                    if marker in (issue.get("body") or ""):
-                        return issue["html_url"]
+                found = next(
+                    (
+                        (i["html_url"], True)
+                        for i in self.github.recent_issues(op.repo, since)
+                        if marker in (i.get("body") or "")
+                    ),
+                    None,
+                )
             elif op.action == "AddComment":
-                for comment in self.github.comments(op.repo, op.number, since=since):
-                    if marker in (comment.get("body") or ""):
-                        return comment["html_url"]
+                found = next(
+                    (
+                        (c["html_url"], True)
+                        for c in self.github.comments(op.repo, op.number, since=since)
+                        if marker in (c.get("body") or "")
+                    ),
+                    None,
+                )
             elif op.action.startswith("SetState:"):
                 issue = self.github.issue(op.repo, op.number)
                 if issue.get("state") == op.action.split(":", 1)[1]:
-                    return issue["html_url"]
+                    found = (issue["html_url"], False)
         except GitHubError as error:
             log.warning("Reconciliation lookup failed: %s", error)
-        return None
+            return None
+        if found:
+            self.store.finish_operation(op.op_id, "done", found[0])
+            self.store.audit(
+                sender_key="system",
+                action=op.action,
+                repo=op.repo,
+                outcome="reconciled" if found[1] else "reconciled_state",
+                url=found[0],
+            )
+        return found
