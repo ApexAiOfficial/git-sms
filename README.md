@@ -26,11 +26,11 @@ git > Created acme/field-reports#57: https://github.com/acme/field-reports/issue
 | `ISSUES [owner/repo] [open\|closed\|all]` | Recent issues (pull requests excluded) |
 | `ISSUE owner/repo#12` | One issue: state, author, labels, excerpt, link |
 | `PRS [owner/repo]`, `PR owner/repo#5` | Open pull requests; one pull request with branch, size and mergeability |
-| `SEARCH words` | Find repositories |
+| `SEARCH words` | Find repositories you may read |
 | `SUMMARIZE owner/repo`, `SUMMARIZE owner/repo#12` | AI summary of a README or a whole issue/PR thread (optional) |
 | `NEW ISSUE [owner/repo] Title -- details` | Open an issue (asks for confirmation) |
 | `COMMENT owner/repo#12 text` | Comment on an issue or pull request (asks for confirmation) |
-| `CLOSE` / `REOPEN owner/repo#12` | Change state (asks for confirmation) |
+| `CLOSE` / `REOPEN owner/repo#12` | Change an issue's state (asks for confirmation; pull requests stay on GitHub) |
 | `CONFIRM 1234`, `ABORT` | Approve or drop the waiting change |
 | `MORE`, `WHOAMI` | Next page of a long reply; your alias and access |
 
@@ -38,19 +38,26 @@ Free-form messages ("what's broken in field reports?") are optionally rewritten 
 language model, and the reply shows how it was understood. A model can never run anything outside this grammar,
 and anything that changes GitHub always needs the confirmation code.
 
-Command words avoid the carrier keywords (`HELP`, `INFO`, `STOP`, `CANCEL`, `END`, `QUIT`, `YES`, `START`...): Twilio
-answers or acts on those itself before the webhook sees them. The original `help` command therefore never reached
-the prototype; `COMMANDS` replaces it.
+Command words avoid the carrier keywords (`HELP`, `INFO`, `STOP`, `CANCEL`, `END`, `QUIT`, `YES`, `START`...).
+With Twilio's default opt-out handling, `HELP` and `INFO` are answered by Twilio and never forwarded, so the
+original `help` command could not reach the prototype; `COMMANDS` replaces it. With Advanced Opt-Out, Twilio
+forwards those keywords flagged with `OptOutType`: Git SMS records the opt-out state and stays silent, so nobody
+gets two replies.
 
 ## How it stays safe
 
-Every message passes, in order: a valid **Twilio signature** for the exact public URL; a one-time **MessageSid**
-claim (redelivery is a no-op); **opt-out** state; an operator-owned **sender directory** (unknown numbers get
-silence); per-sender and global **rate and spend limits**; explicit **repository grants**; and, for any write, a
-**confirmation code** that only the registered handset receives. That last step also defeats a spoofed sender
-number. Writes run under a least-privilege **GitHub App** installation token (or a fine-grained token) and are
-attributed on GitHub to the sender's alias, never their number. The database stores keyed hashes, not phone
-numbers, and every decision is audited. Details: [SECURITY.md](SECURITY.md) and
+Every message passes, in order: a valid **Twilio signature** for the exact public URL; a **durable, one-time
+intake** (the message is committed to the queue before Twilio is answered, and redelivery is a no-op);
+**opt-out** state; an operator-owned **sender directory** (unknown numbers get silence); per-sender and global
+**rate and spend limits**; explicit **repository grants** (search results included); and, for any write, a
+**confirmation code** that only the registered handset receives, which production cannot switch off. That last
+step also defeats a spoofed sender number.
+
+Writes are **journalled and marked**, so a crash or a redelivered message can never repeat one, and a write
+GitHub did not confirm is reported as unconfirmed and never retried blindly. They run under a least-privilege
+**GitHub App** installation token (or a fine-grained token) and are attributed to the sender's alias, not their
+number. Queued messages, replies and pending changes are **encrypted at rest** and expire; senders are stored as
+keyed hashes; every decision is audited. Details: [SECURITY.md](SECURITY.md) and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Getting started
@@ -60,11 +67,15 @@ serve HTTPS. A [Dockerfile](Dockerfile) is included.
 
 ## Status and roadmap
 
-- **Done (0.2):** secure webhook edge, sender directory and grants, confirmed issue/comment/close/reopen,
-  deterministic read commands, SMS-aware paging, optional AI summaries and natural-language routing, audit log,
-  244 automated tests, and a live end-to-end harness against a real GitHub repository.
-- **Next:** carrier-delivered verification on a registered sender (toll-free verification or A2P 10DLC), delivery
-  status tracking, a GitHub App setup helper, optional per-user PINs.
+**Status: production foundation, not yet production-validated.** Everything below is tested against a real
+GitHub repository with simulated (correctly signed) Twilio traffic; no carrier-delivered SMS has been tested yet.
+
+- **Done (0.2):** authenticated webhook edge with a durable queue and crash recovery, sender directory and grants,
+  confirmed issue/comment/close/reopen with a write journal, deterministic read commands, SMS-aware paging,
+  delivery-status tracking, retention, optional AI summaries and natural-language routing under a daily budget,
+  an audit log, 283 automated tests, and live end-to-end and crash-recovery harnesses against a real repository.
+- **Next:** carrier-delivered verification on a registered sender (toll-free verification or A2P 10DLC), a
+  GitHub App setup helper, an audit export command, optional per-user PINs.
 - **Then:** allowlisted `workflow_dispatch` (`RUN deploy staging`) with run tracking, SMS notifications for
   watched issues, and an optional Android SMS-gateway transport for deployments without an SMS provider.
 

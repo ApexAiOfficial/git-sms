@@ -12,8 +12,8 @@ That baseline was sound where it touched GitHub reads, but it could not safely g
   forged POST could act as any number.
 - **No identity, authorisation or audit.** No sender directory, repository grants, confirmation or record of who
   did what. Writes had to stay disabled because nothing could make them safe.
-- **The command channel itself was broken on real numbers.** Twilio answers `HELP` and `INFO` itself and never
-  forwards them, so the prototype's `help` command could not be reached. `YES`, `START`, `STOP`, `CANCEL`, `END` and
+- **The command channel itself was broken on real numbers.** With Twilio's default opt-out handling, `HELP` and
+  `INFO` are answered by Twilio and not forwarded, so the prototype's `help` command could not be reached. `YES`, `START`, `STOP`, `CANCEL`, `END` and
   `QUIT` change a subscriber's opt-out state, so they cannot be command words either.
 - **Synchronous, unbounded replies.** Summaries ran inside the webhook against Twilio's 15-second timeout, replies
   could run to 1,000 characters (seven segments, or 15 if one curly quote forced UCS-2), and nothing deduplicated
@@ -27,20 +27,25 @@ That baseline was sound where it touched GitHub reads, but it could not safely g
 ## Design
 
 ```text
-Twilio ──POST /twilio/sms──▶ app.py
+Twilio ──POST /twilio/sms──▶ app.py (HTTP edge)
                               1. verify X-Twilio-Signature (public URL) and AccountSid
-                              2. claim MessageSid once (SQLite)          ── duplicate? ack, stop
-                              3. ack with empty TwiML immediately
-                              4. background: service.handle(message)
-                                    opt-out keywords ─▶ record, stay silent
+                              2. commit the message, sealed, to the intake queue (MessageSid unique)
+                                                                    ── duplicate? ack, stop
+                              3. ack with empty TwiML
+        worker.py (thread pool, one sender at a time, arrival order)
+                              4. claim the oldest queued message of an idle sender
+                              5. service.handle(message)
+                                    Twilio OptOutType / opt-out keywords ─▶ record, stay silent
                                     sender directory ─▶ unknown: silent
                                     hourly limit     ─▶ one notice, then silent
-                                    parse (deterministic grammar; optional LLM rewrite → re-parse)
-                                    repository grant (read / write)
+                                    parse (grammar; optional LLM rewrite → re-parse, daily AI budget)
+                                    repository grant (read / write; search results filtered)
                                     reads  ─▶ GitHub REST ─▶ SMS text
-                                    writes ─▶ code to the real handset ─▶ CONFIRM ─▶ re-check ─▶ GitHub
-                                    audit every decision; paginate for MORE
-                              5. daily segment budget ─▶ Twilio REST send
+                                    writes ─▶ code to the real handset ─▶ CONFIRM (atomic take)
+                                             ─▶ journal op ─▶ GitHub (with hidden marker) ─▶ done | failed | unknown
+                              6. commit replies to the outbound ledger, retire the message
+                              7. send: daily segment budget ─▶ Twilio REST (SID recorded)
+Twilio ──POST /twilio/status─▶ delivery status recorded against the SID
 ```
 
 | Module | Responsibility |
@@ -48,32 +53,71 @@ Twilio ──POST /twilio/sms──▶ app.py
 | `config.py` | Settings from the environment; refuses unsafe production configuration |
 | `identity.py` | TOML sender directory: E.164 numbers, aliases, read/write repository patterns, optional guests |
 | `commands.py` | The grammar: one typed command per message; reserved-keyword handling; canonical rendering |
-| `service.py` | Policy and orchestration: limits, authorisation, confirmation, reads, writes, audit, paging |
-| `github.py` | REST client with GitHub App or token auth, bounded timeouts, SMS-safe error messages |
+| `service.py` | Policy: limits, authorisation, confirmation, reads, journalled writes, reconciliation, audit, paging |
+| `worker.py` | Background processing: per-sender ordering, crash recovery, sending with retry, retention sweeps |
+| `github.py` | REST client with GitHub App or token auth, bounded timeouts and paging, SMS-safe errors |
 | `llm.py` | Optional OpenAI-compatible model for summaries and for rewriting free text into the grammar |
 | `sms.py` | GSM-7 normalisation, segment counting, pagination that always fits the segment budget |
-| `store.py` | SQLite: inbound idempotency, counters, pending confirmations, context, opt-outs, audit |
-| `app.py` | FastAPI edge, Twilio validation, background processing, senders (Twilio REST, console) |
+| `store.py` | SQLite: intake queue, write journal, outbound ledger, counters, confirmations, context, audit |
+| `app.py` | FastAPI edge, Twilio validation, status callbacks, senders (Twilio REST, console) |
+
+## Delivery guarantees
+
+| What | Guarantee | How |
+| --- | --- | --- |
+| Acknowledged inbound message | At least once | Committed before the 200; re-queued after a crash; given up after 3 failed attempts |
+| One sender's messages | Processed in arrival order | A sender's next message is claimed only when none of theirs is in progress |
+| GitHub write | At most once | Journalled against the triggering MessageSid before the call; re-processing reports or reconciles |
+| Write GitHub did not confirm | Reported as unknown, never retried | Reconciled by its hidden marker when the message is re-processed; the sender is told to check |
+| Reply | At most once after a send starts | Retried only when Twilio certainly did not accept it (429, 503, connect timeout); otherwise recorded |
+
+At-least-once intake is safe because the only effects that matter, GitHub writes, are made at most once by the
+journal; the worst case is a read answered twice after a crash.
 
 ## Decisions
 
 1. **Deterministic grammar first, model second.** The model may only rewrite text into one grammar line, which
    is parsed and authorised like typed input. It can never confirm, and writes it proposes always require the
    code. This keeps natural language useful without making it an authority.
-2. **Confirmation codes on every write by default.** Beyond preventing accidents, the code is sent to the
-   registered handset, so a spoofed `From` number cannot complete a write. One pending change per sender, a
-   10-minute TTL, three attempts, and an atomic take that executes once.
-3. **Acknowledge, then reply over the REST API.** Removes the webhook timeout from the critical path, allows
-   paging and future multi-message flows, and lets the MessageSid claim guarantee at-most-once processing.
-4. **SQLite, one process.** The workload is a few messages a minute. One file to back up keeps the service
-   independently deployable anywhere. Every store method is a small transaction, so moving to PostgreSQL later
-   is mechanical if it is ever needed.
-5. **Least-privilege GitHub identity.** GitHub App installation tokens are the recommended path; user grants
-   are checked on top, so a misconfigured directory still cannot exceed the installation.
-6. **No phone numbers at rest or on GitHub.** Senders are keyed hashes in the database and aliases on GitHub.
-7. **Official Twilio SDK for signature validation and sending**, rather than re-implementing request signing.
-8. **httpx for GitHub and the model** (not provider SDKs): one small dependency, explicit timeouts, and
+2. **Confirmation codes on every write, always in production.** Beyond preventing accidents, the code is sent to
+   the registered handset, so a spoofed `From` number cannot complete a write. One pending change per sender, a
+   10-minute TTL, three attempts, and one atomic compare-and-take.
+3. **Queue durably, acknowledge, then reply over the REST API.** The webhook does one small transaction, which
+   keeps it far inside Twilio's timeout and makes a crash after the 200 recoverable.
+4. **Journal writes; never replay an uncertain one.** Issue and comment creation are not idempotent on GitHub.
+   Rather than retry, each write is keyed to its triggering message and carries a marker that reconciliation can
+   find, and an unconfirmed outcome is surfaced to the person who asked.
+5. **SQLite, one process, a worker pool.** The workload is a few messages a minute. One file to back up keeps the
+   service independently deployable anywhere, and every store method is one transaction.
+6. **Least-privilege GitHub identity.** GitHub App installation tokens are the recommended path; user grants are
+   checked on top, including on search results, so a misconfigured directory still cannot exceed the
+   installation and a sender never learns of repositories outside their grants.
+7. **Seal what must be kept, delete it when done.** Queued messages, replies, pending changes and pages are
+   AES-GCM encrypted under a key that never enters the database and expire on schedule; senders are keyed hashes.
+8. **Official Twilio SDK for signature validation and sending**, rather than re-implementing request signing.
+9. **httpx for GitHub and the model** (not provider SDKs): one small dependency, explicit timeouts, and
    `MockTransport` makes every API interaction testable without the network.
+
+## Review record
+
+An independent review of `9fa5797` (2026-10-21) raised these findings. Each confirmed one has a regression test
+that fails on `9fa5797`.
+
+| Finding | Verdict | Resolution |
+| --- | --- | --- |
+| GS-01 acknowledged messages lost; ambiguous writes | Confirmed | Durable sealed intake, crash recovery, write journal with markers and reconciliation; unit kill points plus a SIGKILL end-to-end run |
+| GS-02 SEARCH reveals out-of-grant private repos | Confirmed | Results filtered by read grants before formatting |
+| GS-03 production allows confirmation-free writes | Confirmed | Refused in production |
+| GS-04 sensitive content kept without retention | Confirmed | Sealing, expiry, retention sweep, `0600` database, backup guidance |
+| GS-05 "no phone numbers at rest" overstated | Confirmed (docs) | The users file, `.env` and user-written GitHub text are now named explicitly; the dev outbox no longer stores numbers |
+| GS-06 no outbound ledger or delivery status | Confirmed | Ledger with Twilio SIDs, signed status callbacks, retry for certain failures, budget refunds |
+| GS-07 same-sender reordering; confirm races | Confirmed | Per-sender FIFO claim; atomic compare-and-take |
+| GS-08 no global AI budget | Confirmed | Global daily call budget; no AI for guests |
+| GS-09 HELP forwarding overstated | Partly: true for default handling, not with Advanced Opt-Out | `OptOutType` honoured and never answered; docs say which configuration does what |
+| GS-10 CLOSE/REOPEN on pull requests unproven | Confirmed | Pull request state changes refused; PR comment permissions documented as unverified |
+| GS-11 dev mode and release hardening | Partly | Unsigned ingress needs an explicit dev-only flag; CI builds and installs the wheel and audits dependencies. Live reverse-proxy and Twilio validation remain carrier-test work |
+| GS-14 first-page-only issue and comment reads | Confirmed | Bounded multi-page reads |
+| Not in the review: a write timeout told the user "Try again" | Confirmed | Unknown-outcome reply, and a duplicate warning before an identical write |
 
 ## Roadmap
 

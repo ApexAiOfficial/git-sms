@@ -41,6 +41,31 @@ jobs:
           test "$status" -ne 0 && grep -q "TWILIO_AUTH_TOKEN" out.txt
       - name: Serves health in development mode
         run: |
-          docker run -d --name gs -p 8000:8000 -e GIT_SMS_ENV=development -e GIT_SMS_SENDER=console git-sms:ci
+          docker run -d --name gs -p 8000:8000 -e GIT_SMS_ENV=development -e GIT_SMS_SENDER=console \
+            -e TWILIO_AUTH_TOKEN=ci-only-token git-sms:ci
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/healthz && exit 0; sleep 1; done
           docker logs gs; exit 1
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build, then install the wheel into a clean environment
+        run: |
+          pip install build
+          python -m build --outdir dist .
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+      - name: The installed console script serves health
+        run: |
+          GIT_SMS_ENV=development GIT_SMS_SENDER=console TWILIO_AUTH_TOKEN=ci-only-token \
+            GIT_SMS_DB_PATH=/tmp/ci.db PORT=8001 /tmp/clean/bin/git-sms &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8001/healthz && exit 0; sleep 1; done
+          exit 1
+      - name: No known vulnerabilities in the pinned dependencies
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
