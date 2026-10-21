@@ -14,3 +14,10 @@ dist/
 .vscode/
 .idea/
 .DS_Store
+# Runtime state and private configuration
+*.db
+*.db-shm
+*.db-wal
+users.toml
+*.pem
+outbox.jsonl
