@@ -11,13 +11,17 @@ controllable, and webhooks carry real signatures computed with the Twilio SDK. T
 - the grammar, including every carrier keyword, malformed input and canonical round-trips;
 - the sender directory and repository-grant matching (including owner-boundary wildcards);
 - GSM-7/UCS-2 segment counting and pagination that always fits the budget;
-- the store: one-time MessageSid claims under concurrency, fixed windows, at-most-once confirmations, and a
-  byte-level check that no phone number reaches the database file;
+- the store: one-time intake under concurrency, per-sender ordering, crash recovery, the outbound ledger, the
+  write journal, atomic confirmation, retention sweeps, sealing bound to the sender, and a byte-level check that
+  no phone number, message text or code reaches the database file;
 - GitHub auth (token and App JWT, token caching) and error mapping;
 - service behaviour end to end: authorisation, confirmation codes (wrong, expired, replaced, bound to the
   sender, grants re-checked), limits, opt-outs, guests, paging, summaries and natural-language safety;
-- the HTTP edge: forged, unsigned, tampered, wrong-URL and wrong-account webhooks are rejected before any work;
-  redelivery is processed once; the spend ceiling stops sending.
+- the HTTP edge and worker: forged, unsigned, tampered, wrong-URL and wrong-account webhooks are rejected before
+  queueing; redelivery is processed once; each crash window (after the 200, mid-processing, after the GitHub
+  write, mid-write with and without evidence on GitHub) recovers without loss or a repeated write; transient,
+  permanent and ambiguous send failures are handled distinctly; status callbacks are verified; Advanced Opt-Out
+  messages are never answered.
 
 ## 2. Signed-webhook end-to-end run (`e2e/signed_webhook_e2e.py`)
 
@@ -44,7 +48,18 @@ python e2e/signed_webhook_e2e.py --url http://127.0.0.1:8765 --repo your-org/git
 
 GitHub's list endpoints can lag a write by a few seconds; the harness polls them before concluding.
 
-## 3. Carrier-delivered runs
+## 3. Crash-recovery end-to-end run (`e2e/crash_recovery_e2e.py`)
+
+Same environment as above, but the harness starts the server itself. It gets a confirmation code, queues a burst
+of reads followed by the `CONFIRM` from one sender, `SIGKILL`s the server as soon as the last webhook is
+acknowledged, restarts it on the same database, and checks that every acknowledged message is answered, that the
+confirmation is answered once, and, through the GitHub API, that exactly one issue carrying its reconciliation
+marker exists. It also checks that the kill really left work unfinished, so a pass is meaningful.
+
+Both harnesses simulate Twilio with correctly signed requests and read replies from the development outbox. They
+prove the server and GitHub legs, not carrier delivery.
+
+## 4. Carrier-delivered runs (not yet done)
 
 The last legs (handset → carrier → Twilio → webhook, and the reply back) need a real Twilio number, a public HTTPS
 URL, and a sender registered for US traffic (toll-free verification or A2P 10DLC). Without registration, inbound
