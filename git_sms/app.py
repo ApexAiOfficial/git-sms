@@ -31,6 +31,7 @@ from git_sms.worker import Sender, SendError, Worker
 
 log = logging.getLogger(__name__)
 EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+STALL_SECONDS = 120
 
 
 class TwilioSender:
@@ -63,8 +64,9 @@ class TwilioSender:
             return self._client.messages.create(to=to, body=body, **route).sid
         except TwilioRestException as error:
             detail = f"twilio {error.status} {error.code or ''}".strip()
-            if error.status in (429, 503):
+            if error.status == 429:  # rate limited: rejected before processing
                 raise SendError(detail, retry=True) from error
+            # Any 5xx may hide an accepted message, so it is never resent; 4xx are definite refusals.
             raise SendError(detail, ambiguous=error.status >= 500) from error
         except requests.exceptions.ConnectTimeout as error:
             raise SendError("connect timeout", retry=True) from error
@@ -185,6 +187,18 @@ def create_app(
             num_media = int(params.get("NumMedia") or 0)
         except ValueError:
             num_media = 0
+        if service.directory.lookup(sender_number) is None:
+            # Not in the directory: never answered, so not worth a queue slot either.
+            service.store.audit(
+                sender_key=service.store.sender_key(sender_number),
+                message_sid=message_sid,
+                action="unknown_sender",
+                outcome="ignored",
+            )
+            return Response(content=EMPTY_TWIML, media_type="application/xml")
+        if service.store.queue_depth() >= settings.max_queued:
+            log.error("Intake queue full (%d); refusing a webhook so Twilio records the failure", settings.max_queued)
+            return Response(status_code=503)
         payload = {
             "from": sender_number,
             "to": params.get("To", ""),
@@ -213,6 +227,21 @@ def create_app(
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
+        """Liveness: the process answers."""
         return JSONResponse({"status": "ok", "version": __version__})
+
+    @app.get("/readyz")
+    def readyz() -> JSONResponse:
+        """Readiness: the worker is running and the queues are moving. Counts only, no identifiers."""
+        health = service.store.health()
+        problems = []
+        if start_worker and not worker.alive():
+            problems.append("worker not running")
+        if health["oldest_inbound_seconds"] > STALL_SECONDS:
+            problems.append("inbound queue stalled")
+        if health["oldest_reply_seconds"] > STALL_SECONDS:
+            problems.append("replies stalled")
+        body = {"status": "ready" if not problems else "not_ready", "problems": problems, **health}
+        return JSONResponse(body, status_code=200 if not problems else 503)
 
     return app

@@ -12,6 +12,7 @@ from git_sms.store import Store
 from .conftest import ALICE, BOB, Clock
 
 PAYLOAD = {"from": ALICE, "to": "+15550100100", "body": "new issue acme/x Secret plans", "num_media": 0}
+META = {"action": "CreateIssue", "repo": "acme/x", "number": None, "fingerprint": "fp"}
 
 
 def make(clock=None, path=":memory:"):
@@ -104,9 +105,8 @@ def test_outbound_retry_and_delivery_callbacks(clock):
     again = store.claim_outbound()
     assert again.attempts == 2 and again.payload["body"] == "hi"
     store.settle_outbound(again.id, "accepted", provider_sid="SMout1")
-    assert store.record_delivery("SMout1", "undelivered", "30034")
-    assert not store.record_delivery("SMother", "delivered", None)
-    assert store.outbound_for("SM1") == [("undelivered", "SMout1", "twilio 30034", 2)]
+    assert store.record_delivery("SMout1", "undelivered", "30034") == "applied"
+    assert store.outbound_for("SM1") == [("accepted", "SMout1", "twilio 30034", 2, "undelivered")]
 
 
 # Write journal ---------------------------------------------------------------------------
@@ -114,9 +114,13 @@ def test_outbound_retry_and_delivery_callbacks(clock):
 
 def test_operations_are_journalled_once(clock):
     store = make(clock)
-    assert store.begin_operation("op1", "k", "CreateIssue", "acme/x", None, "fp") is None
-    again = store.begin_operation("op1", "k", "CreateIssue", "acme/x", None, "fp")
-    assert again.status == "executing"
+    assert store.record_intent("op1", "k", "CreateIssue", "acme/x", None, "fp", {"type": "CreateIssue"}) is None
+    again = store.record_intent("op1", "k", "CreateIssue", "acme/x", None, "fp", {"type": "CreateIssue"})
+    assert again.status == "confirmed"
+    assert store.intent("op1") == {"type": "CreateIssue"}
+    assert store.start_operation("op1")
+    assert not store.start_operation("op1")
+    assert store.intent("op1") is None
     store.finish_operation("op1", "done", "https://github.com/acme/x/issues/1")
     assert store.operation("op1").url.endswith("/issues/1")
     assert store.similar_operation("k", "fp", 3600).op_id == "op1"
@@ -150,29 +154,45 @@ def test_fixed_windows_reset_and_refunds_floor_at_zero():
 
 def test_confirmation_is_atomic_and_single_use(clock):
     store = make(clock)
-    assert not store.set_pending("k", "1234", {"type": "CreateIssue"}, 600)
-    assert store.confirm_pending("k", "0000", 3) == ("wrong", None)
-    assert store.confirm_pending("k", "1234", 3) == ("ok", {"type": "CreateIssue"})
-    assert store.confirm_pending("k", "1234", 3) == ("none", None)
+    assert not store.set_pending("k", "1234", {"type": "CreateIssue"}, 600, **META)
+    assert store.confirm_pending("k", "0000", 3, "op1") == ("wrong", None)
+    assert store.operation("op1") is None
+    assert store.confirm_pending("k", "1234", 3, "op1") == ("ok", {"type": "CreateIssue"})
+    assert store.confirm_pending("k", "1234", 3, "op2") == ("none", None)
+
+
+def test_confirmation_becomes_a_durable_intent_in_the_same_transaction(tmp_path):
+    """Second review P1-01: consuming the pending change and journalling it must not be separable."""
+    path = str(tmp_path / "db.sqlite")
+    store = make(path=path)
+    store.set_pending("k", "1234", {"type": "CreateIssue", "title": "T"}, 600, **META)
+    store.confirm_pending("k", "1234", 3, "op1")
+    store.close()  # the process dies here, before any attempt
+    revived = make(path=path)
+    op = revived.operation("op1")
+    assert (op.status, op.action, op.repo) == ("confirmed", "CreateIssue", "acme/x")
+    assert revived.intent("op1") == {"type": "CreateIssue", "title": "T"}
+    assert revived.confirm_pending("k", "1234", 3, "op9") == ("none", None)
 
 
 def test_confirmation_locks_after_max_attempts_and_expires(clock):
     store = make(clock)
-    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600)
-    assert [store.confirm_pending("k", "0000", 3)[0] for _ in range(3)] == ["wrong", "wrong", "locked"]
-    assert store.confirm_pending("k", "1234", 3) == ("none", None)
-    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600)
+    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600, **META)
+    assert [store.confirm_pending("k", "0000", 3, "op")[0] for _ in range(3)] == ["wrong", "wrong", "locked"]
+    assert store.confirm_pending("k", "1234", 3, "op") == ("none", None)
+    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600, **META)
     clock.advance(601)
-    assert store.confirm_pending("k", "1234", 3) == ("expired", None)
+    assert store.confirm_pending("k", "1234", 3, "op") == ("expired", None)
+    assert store.operation("op") is None
 
 
 def test_concurrent_confirmations_execute_once(tmp_path):
     store = make(path=str(tmp_path / "db.sqlite"))
-    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600)
+    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600, **META)
     outcomes = []
 
     def attempt():
-        outcomes.append(store.confirm_pending("k", "1234", 3)[0])
+        outcomes.append(store.confirm_pending("k", "1234", 3, f"op-{threading.get_ident()}")[0])
 
     threads = [threading.Thread(target=attempt) for _ in range(12)]
     for thread in threads:
@@ -184,11 +204,11 @@ def test_concurrent_confirmations_execute_once(tmp_path):
 
 def test_replacing_reports_only_live_requests(clock):
     store = make(clock)
-    store.set_pending("k", "1111", {"type": "CreateIssue"}, 600)
-    assert store.set_pending("k", "2222", {"type": "CreateIssue"}, 600)
+    store.set_pending("k", "1111", {"type": "CreateIssue"}, 600, **META)
+    assert store.set_pending("k", "2222", {"type": "CreateIssue"}, 600, **META)
     clock.advance(601)
-    assert not store.set_pending("k", "3333", {"type": "CreateIssue"}, 600)
-    assert store.confirm_pending("k", "2222", 3)[0] == "wrong"
+    assert not store.set_pending("k", "3333", {"type": "CreateIssue"}, 600, **META)
+    assert store.confirm_pending("k", "2222", 3, "op")[0] == "wrong"
 
 
 # Context, opt-outs, retention ------------------------------------------------------------
@@ -217,11 +237,11 @@ def test_sweep_applies_retention_but_keeps_unresolved_writes(clock):
     store.enqueue_inbound("SM1", "k", PAYLOAD)
     store.complete_inbound(store.claim_inbound(), [({"to": ALICE, "from": "+1", "body": "x"}, 1)])
     store.settle_outbound(store.claim_outbound().id, "accepted", provider_sid="SMo")
-    store.begin_operation("done-op", "k", "CreateIssue", "acme/x", None, "fp")
+    store.record_intent("done-op", "k", "CreateIssue", "acme/x", None, "fp", {})
     store.finish_operation("done-op", "done", "u")
-    store.begin_operation("unknown-op", "k", "CreateIssue", "acme/x", None, "fp2")
+    store.record_intent("unknown-op", "k", "CreateIssue", "acme/x", None, "fp2", {})
     store.finish_operation("unknown-op", "unknown")
-    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600)
+    store.set_pending("k", "1234", {"type": "CreateIssue"}, 600, **META)
     store.set_pages("k", ["p"], 3600)
     store.audit(sender_key="k", action="x", outcome="y")
 
@@ -253,7 +273,8 @@ def test_database_file_holds_no_phone_numbers_or_message_text(tmp_path):
     store.enqueue_inbound("SM1", key, PAYLOAD)  # still queued: sealed, not plaintext
     store.enqueue_inbound("SM2", key, PAYLOAD)
     store.complete_inbound(store.claim_inbound(), [({"to": ALICE, "from": "+1", "body": "Secret plans reply"}, 1)])
-    store.set_pending(key, "1234", {"type": "CreateIssue", "repo": "acme/x", "title": "Secret plans"}, 600)
+    store.set_pending(key, "1234", {"type": "CreateIssue", "repo": "acme/x", "title": "Secret plans"}, 600, **META)
+    store.record_intent("op1", key, "CreateIssue", "acme/x", None, "fp", {"title": "Secret plans"})
     store.set_pages(key, ["Secret plans page two"], 3600)
     store.set_default_repo(key, "acme/x")
     store.audit(sender_key=key, action="CreateIssue", outcome="done", alias="alice")
@@ -288,3 +309,76 @@ def test_foreign_schema_versions_are_refused(tmp_path):
     db.close()
     with pytest.raises(ConfigError, match="schema version 0"):
         make(path=str(path))
+
+
+# Second review: outbound ordering and delivery callbacks ---------------------------------
+
+
+def _replies(store, sender, sids):
+    for message_sid in sids:
+        store.enqueue_inbound(message_sid, sender, {"from": ALICE, "to": "+1", "body": "x"})
+        store.complete_inbound(store.claim_inbound(), [({"to": ALICE, "from": "+1", "body": message_sid}, 1)])
+
+
+def test_one_senders_replies_are_handed_over_one_at_a_time_in_order(clock):
+    """P2-03: a later reply must not overtake an earlier one that is in flight or waiting to retry."""
+    store = make(clock)
+    _replies(store, "alice", ["SM1", "SM2"])
+    _replies(store, "bob", ["SM3"])
+    first = store.claim_outbound()
+    assert first.payload["body"] == "SM1"
+    assert store.claim_outbound().payload["body"] == "SM3"  # other senders are not blocked
+    assert store.claim_outbound() is None  # SM2 waits while SM1 is in flight
+    store.retry_outbound(first.id, 30, "twilio 429")
+    assert store.claim_outbound() is None  # and while SM1 waits to retry
+    clock.advance(31)
+    assert store.claim_outbound().payload["body"] == "SM1"
+
+
+def test_delivery_status_only_moves_forward(clock):
+    """P2-04: callbacks can repeat and arrive out of order."""
+    store = make(clock)
+    _replies(store, "alice", ["SM1"])
+    store.settle_outbound(store.claim_outbound().id, "accepted", provider_sid="SMo")
+    assert store.record_delivery("SMo", "sent", None) == "applied"
+    assert store.record_delivery("SMo", "delivered", None) == "applied"
+    assert store.record_delivery("SMo", "sent", None) == "stale"
+    assert store.record_delivery("SMo", "delivered", None) == "stale"
+    assert store.record_delivery("SMo", "undelivered", "30003") == "stale"  # one terminal status wins
+    assert store.record_delivery("SMo", "read", None) == "applied"
+    assert store.record_delivery("SMo", "nonsense", None) == "ignored"
+    assert store.outbound_for("SM1")[0][4] == "read"
+
+
+def test_a_callback_that_beats_the_send_record_is_kept(clock):
+    """P2-04: Twilio may call back before the send has recorded the SID."""
+    store = make(clock)
+    _replies(store, "alice", ["SM1"])
+    message = store.claim_outbound()
+    assert store.record_delivery("SMo", "sent", None) == "early"
+    assert store.record_delivery("SMo", "undelivered", "30034") == "early"
+    assert store.record_delivery("SMo", "queued", None) == "early"  # an older early event does not regress it
+    store.settle_outbound(message.id, "accepted", provider_sid="SMo")
+    assert store.outbound_for("SM1") == [("accepted", "SMo", "twilio 30034", 1, "undelivered")]
+
+
+def test_twilio_statuses_never_collide_with_the_send_lifecycle(clock):
+    """Found in the second pass: Twilio's own 'sending' status must not look like an interrupted send."""
+    store = make(clock)
+    _replies(store, "alice", ["SM1", "SM2"])
+    store.settle_outbound(store.claim_outbound().id, "accepted", provider_sid="SMo")
+    store.record_delivery("SMo", "sending", None)
+    assert store.recover() == {"requeued": 0, "unknown_sends": 0}
+    assert store.outbound_for("SM1")[0][0] == "accepted"
+    assert store.claim_outbound().payload["body"] == "SM2"  # the sender is not blocked by it
+
+
+def test_health_counts_without_identifiers(clock):
+    store = make(clock)
+    store.enqueue_inbound("SM1", "alice", PAYLOAD)
+    store.record_intent("op1", "k", "CreateIssue", "acme/x", None, "fp", {})
+    clock.advance(30)
+    health = store.health()
+    assert health["inbound_waiting"] == 1 and health["oldest_inbound_seconds"] == 30
+    assert health["writes_approved_unattempted"] == 1
+    assert ALICE not in str(health)
