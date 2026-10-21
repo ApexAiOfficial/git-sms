@@ -18,6 +18,9 @@ That baseline was sound where it touched GitHub reads, but it could not safely g
 - **Synchronous, unbounded replies.** Summaries ran inside the webhook against Twilio's 15-second timeout, replies
   could run to 1,000 characters (seven segments, or 15 if one curly quote forced UCS-2), and nothing deduplicated
   redelivered webhooks.
+- **Its AI provider no longer exists.** The prototype defaulted to GitHub Models, which GitHub retired on
+  2026-07-30; its endpoint now answers `200 OK` in plain text, which the old code would have treated as a failure
+  at best. Git SMS now speaks the OpenAI-compatible protocol to any provider and requires the model to be named.
 - **The language model routed actions.** Free text went to a model that picked an action and could guess a
   repository from a search result: unacceptable once writes exist.
 

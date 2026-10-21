@@ -56,8 +56,10 @@ Copy [.env.example](.env.example) to `.env` (keep it private) and fill in at lea
 | `TWILIO_API_KEY_SID`, `TWILIO_API_KEY_SECRET` | Optional: send with a revocable API key instead of the auth token. |
 | `TWILIO_MESSAGING_SERVICE_SID` | Optional: reply through a Messaging Service instead of the receiving number. |
 
-Optional: `GITHUB_MODELS_TOKEN` or `OPENAI_API_KEY` (or `LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL` for any
-OpenAI-compatible endpoint) enables `SUMMARIZE` and free-form messages. Limits such as
+Optional: `LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL` for any OpenAI-compatible chat-completions endpoint (OpenAI,
+Azure AI Foundry, a self-hosted vLLM or Ollama server...), or just `OPENAI_API_KEY` + `LLM_MODEL`, enables
+`SUMMARIZE` and free-form messages. Name the model explicitly; there is no default. (GitHub Models, which the
+original prototype used, was retired on 2026-07-30; its variables are now refused with an explanation.) Limits such as
 `GIT_SMS_MAX_SEGMENTS_PER_DAY` are listed in `.env.example`.
 
 The server refuses to start in production if anything security-relevant is missing.

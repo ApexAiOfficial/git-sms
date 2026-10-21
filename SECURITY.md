@@ -26,6 +26,9 @@ change, and what happens when something misbehaves. Controls, in the order each 
 ## Known limits
 
 - SMS is not end-to-end encrypted: carriers and Twilio can read message content. Do not text secrets.
+- If an AI model is configured, unrecognised messages and the repository or thread content being summarised
+  (including private repositories the credential can read) are sent to that provider. Leave the model unset, or
+  use a provider you trust with that data.
 - A stolen or SIM-swapped phone can confirm writes within its grants. Keep write grants narrow; an optional
   per-user PIN is on the roadmap.
 - Processing is in-process: if the server stops mid-message, that message is marked `received` and is not
