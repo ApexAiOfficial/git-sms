@@ -2,9 +2,9 @@
 
 import json
 
-from git_sms.service import COMMANDS_TEXT, NOT_UNDERSTOOD
+from git_sms.service import COMMANDS_TEXT, NOT_UNDERSTOOD, Inbound
 
-from .conftest import ALICE, BOB, STRANGER, Conversation, FakeLLM
+from .conftest import ALICE, BOB, ISSUE_12, PR_13, STRANGER, Conversation, FakeLLM
 
 WRITE_PATH = "POST /repos/acme/field-reports/issues"
 
@@ -337,3 +337,101 @@ def test_phone_numbers_never_reach_the_audit_log(make_service):
     dump = json.dumps([entry.__dict__ for entry in entries])
     for phone in (ALICE, BOB, STRANGER):
         assert phone not in dump and phone[1:] not in dump
+
+
+# Audit regressions (GPT-6 review of 9fa5797) ------------------------------------------
+
+
+def test_search_never_reveals_repositories_outside_the_senders_grants(make_service, api):
+    """GS-02: the service credential can see private repos the sender may not."""
+    api.add(
+        "GET",
+        "/search/repositories",
+        {
+            "items": [
+                {"full_name": "other/secret", "description": "Acquisition plans", "private": True},
+                {"full_name": "acme/field-reports", "description": "Reports"},
+                {"full_name": "acme/docs", "description": "Docs"},
+            ]
+        },
+    )
+    reply = chat(make_service(), BOB).send("search plans")
+    assert "other/secret" not in reply and "Acquisition" not in reply
+    assert reply == "1) acme/field-reports - Reports\n2) acme/docs - Docs"
+
+
+def test_search_with_only_out_of_grant_results_says_nothing_matches(make_service, api):
+    api.add("GET", "/search/repositories", {"items": [{"full_name": "other/secret", "description": "x"}]})
+    assert chat(make_service(), BOB).send("search secret") == "No repositories match."
+
+
+def test_pull_request_state_changes_are_refused(make_service, api):
+    """GS-10: CLOSE/REOPEN on a PR would need the Pull requests permission; it is a GitHub-side decision."""
+    alice = chat(make_service())
+    assert alice.send("close acme/field-reports#13") == (
+        "CLOSE and REOPEN work on issues only. Manage pull requests on GitHub."
+    )
+    assert alice.send("confirm 4821") == "Nothing is waiting for confirmation."
+    assert api.calls("PATCH") == []
+    assert alice.send("comment acme/field-reports#13 LGTM").startswith("Reply CONFIRM 4821")
+
+
+def test_issue_lists_look_past_a_page_of_pull_requests(make_service, api):
+    """GS-14: the issues API interleaves PRs; the first page can be all PRs."""
+    prs = [{**PR_13, "number": n} for n in range(200, 260)]
+    api.add("GET", "/repos/acme/field-reports/issues", [*prs, {**ISSUE_12, "number": 5, "title": "Real issue"}])
+    assert "#5 Real issue" in chat(make_service()).send("issues acme/field-reports")
+
+
+def test_ai_has_a_global_daily_budget(make_service, clock):
+    """GS-08: per-sender limits alone do not bound total model spend."""
+    llm = FakeLLM(interpret="REPO acme/field-reports")
+    service = make_service(llm=llm, max_ai_calls_per_day=2)
+    chat(service).send("tell me about field reports")
+    chat(service, BOB).send("and again")
+    assert chat(service).send("summarize acme/field-reports") == (
+        "AI features have reached today's limit. Try REPO or ISSUE instead."
+    )
+    assert chat(service, BOB).send("one more free-form question") == NOT_UNDERSTOOD
+    assert len(llm.interpreted) == 2 and llm.summarized == []
+    clock.advance(86400)
+    assert chat(service).send("summarize acme/field-reports").startswith("acme/field-reports:")
+
+
+def test_guests_never_use_the_model(make_service):
+    llm = FakeLLM(interpret="REPO acme/field-reports")
+    guest = chat(make_service(llm=llm, public_read=True), STRANGER)
+    assert guest.send("what is this") == NOT_UNDERSTOOD
+    assert guest.send("summarize acme/field-reports") == (
+        "AI summaries are for registered users. Try REPO or ISSUE instead."
+    )
+    assert llm.interpreted == [] and llm.summarized == []
+
+
+def test_reprocessing_a_confirmation_never_repeats_the_write(make_service, api):
+    service = make_service()
+    alice = chat(service)
+    alice.send("new issue acme/field-reports Once")
+    confirm = Inbound("SM-confirm-1", ALICE, "+15550100100", "confirm 4821")
+    assert service.handle(confirm) == ["Created acme/field-reports#99: https://github.com/acme/field-reports/issues/99"]
+    assert service.handle(confirm) == ["Already done: https://github.com/acme/field-reports/issues/99"]
+    assert api.calls("POST") == [WRITE_PATH]
+
+
+def test_writes_carry_a_hidden_marker_tied_to_the_message(make_service, api):
+    service = make_service()
+    alice = chat(service)
+    alice.send("new issue acme/field-reports Marked")
+    service.handle(Inbound("SM-confirm-2", ALICE, "+15550100100", "confirm 4821"))
+    body = json.loads(api.requests[-1].content)["body"]
+    assert body.endswith(f"<!-- git-sms:{service.store.op_id('SM-confirm-2')} -->")
+
+
+def test_definite_github_rejections_are_not_left_unknown(make_service, api):
+    api.add("POST", "/repos/acme/field-reports/issues", {"message": "Validation Failed"}, status=422)
+    service = make_service()
+    alice = chat(service)
+    alice.send("new issue acme/field-reports Rejected")
+    assert alice.send("confirm 4821") == "GitHub rejected the request."
+    assert service.store.similar_operation(service.store.sender_key(ALICE), "x", 86400) is None
+    assert "already" not in alice.send("new issue acme/field-reports Rejected")

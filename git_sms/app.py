@@ -1,9 +1,10 @@
-"""HTTP edge: verify Twilio's signature, record the message once, answer at once,
-then process it in the background and reply over the Twilio REST API.
+"""HTTP edge: verify Twilio's signature, queue the message durably, answer at once.
 
-Acknowledging immediately keeps every request far inside Twilio's 15-second webhook
-timeout even when GitHub or the language model is slow, and the MessageSid claim
-makes a redelivered webhook a no-op instead of a second GitHub write.
+The message (sealed) is committed to the intake queue before Twilio receives its 200,
+so an acknowledged message survives a crash; the worker processes it in the
+background and replies over the Twilio REST API. A redelivered webhook with the same
+MessageSid is acknowledged and ignored. Twilio's delivery-status callbacks are
+verified the same way and recorded against the outbound ledger.
 """
 
 from __future__ import annotations
@@ -12,9 +13,10 @@ import json
 import logging
 import threading
 import time
-from typing import Protocol
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from git_sms import __version__
@@ -22,16 +24,13 @@ from git_sms.config import Settings
 from git_sms.github import AppAuth, GitHub, TokenAuth
 from git_sms.identity import Directory
 from git_sms.llm import LLM
-from git_sms.service import Inbound, Service
+from git_sms.service import Service
 from git_sms.sms import segments
 from git_sms.store import Store
+from git_sms.worker import Sender, SendError, Worker
 
 log = logging.getLogger(__name__)
 EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
-
-
-class Sender(Protocol):
-    def send(self, *, to: str, from_: str, body: str) -> str | None: ...
 
 
 class TwilioSender:
@@ -51,25 +50,40 @@ class TwilioSender:
             self._client = Client(settings.twilio_account_sid, settings.twilio_auth_token, http_client=http_client)
         self._messaging_service_sid = settings.twilio_messaging_service_sid
 
-    def send(self, *, to: str, from_: str, body: str) -> str | None:
+    def send(self, *, to: str, from_: str, body: str, status_callback: str | None = None) -> str | None:
+        import requests
+        from twilio.base.exceptions import TwilioRestException
+
         route = (
             {"messaging_service_sid": self._messaging_service_sid} if self._messaging_service_sid else {"from_": from_}
         )
-        return self._client.messages.create(to=to, body=body, **route).sid
+        if status_callback:
+            route["status_callback"] = status_callback
+        try:
+            return self._client.messages.create(to=to, body=body, **route).sid
+        except TwilioRestException as error:
+            detail = f"twilio {error.status} {error.code or ''}".strip()
+            if error.status in (429, 503):
+                raise SendError(detail, retry=True) from error
+            raise SendError(detail, ambiguous=error.status >= 500) from error
+        except requests.exceptions.ConnectTimeout as error:
+            raise SendError("connect timeout", retry=True) from error
+        except requests.exceptions.RequestException as error:
+            raise SendError(type(error).__name__, ambiguous=True) from error
 
 
 class ConsoleSender:
-    """Development sender: logs replies and optionally appends them to a JSONL outbox."""
+    """Development sender: logs replies and optionally appends them (without numbers) to a JSONL outbox."""
 
     def __init__(self, outbox: str | None = None):
         self._outbox = outbox
         self._lock = threading.Lock()
 
-    def send(self, *, to: str, from_: str, body: str) -> str | None:
+    def send(self, *, to: str, from_: str, body: str, status_callback: str | None = None) -> str | None:
         log.info("console reply (%d segments): %s", segments(body), body)
         if self._outbox:
             with self._lock, open(self._outbox, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"at": time.time(), "to": to, "from": from_, "body": body}) + "\n")
+                handle.write(json.dumps({"at": time.time(), "body": body}) + "\n")
         return None
 
 
@@ -113,6 +127,7 @@ def create_app(
     *,
     service: Service | None = None,
     sender: Sender | None = None,
+    start_worker: bool = True,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     settings.validate()
@@ -123,43 +138,46 @@ def create_app(
         from twilio.request_validator import RequestValidator
 
         validator = RequestValidator(settings.twilio_auth_token)
+    else:
+        log.warning("GIT_SMS_ALLOW_UNSIGNED is on: webhooks are NOT authenticated. Development only.")
+    status_callback = (
+        f"{settings.public_url}/twilio/status" if settings.public_url and settings.sender_backend == "twilio" else None
+    )
+    worker = Worker(service, sender, settings, status_callback)
 
-    app = FastAPI(title="Git SMS", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
-    app.state.service = service
-    app.state.sender = sender
-
-    def process(inbound: Inbound) -> None:
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if start_worker:
+            worker.start()
         try:
-            replies = service.handle(inbound)
-            for body in replies:
-                used = service.store.consume("segments:all", 86400, segments(body))
-                if used > settings.max_segments_per_day:
-                    log.error("Daily SMS segment budget exhausted; reply not sent")
-                    service.store.audit(
-                        sender_key=service.store.sender_key(inbound.sender),
-                        message_sid=inbound.message_sid,
-                        action="send",
-                        outcome="budget_exhausted",
-                    )
-                    break
-                sender.send(to=inbound.sender, from_=inbound.recipient, body=body)
-            service.store.finish_inbound(inbound.message_sid, "done")
-        except Exception:
-            log.exception("Processing failed for an inbound message")
-            service.store.finish_inbound(inbound.message_sid, "failed")
+            yield
+        finally:
+            if start_worker:
+                worker.stop()
 
-    async def twilio_sms(request: Request, background: BackgroundTasks) -> Response:
+    app = FastAPI(
+        title="Git SMS", version=__version__, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
+    )
+    app.state.service = service
+    app.state.worker = worker
+
+    async def verified_params(request: Request) -> dict[str, str] | None:
         form = await request.form()
         params = {key: str(value) for key, value in form.multi_items()}
         if validator is not None:
             signature = request.headers.get("X-Twilio-Signature", "")
             if not signature or not validator.validate(signed_url(settings, request), params, signature):
-                log.warning("Rejected a webhook with a missing or invalid Twilio signature")
-                return Response(status_code=403)
+                log.warning("Rejected a request with a missing or invalid Twilio signature")
+                return None
         if settings.twilio_account_sid and params.get("AccountSid") != settings.twilio_account_sid:
-            log.warning("Rejected a webhook for another Twilio account")
-            return Response(status_code=403)
+            log.warning("Rejected a request for another Twilio account")
+            return None
+        return params
 
+    async def twilio_sms(request: Request) -> Response:
+        params = await verified_params(request)
+        if params is None:
+            return Response(status_code=403)
         message_sid, sender_number = params.get("MessageSid", ""), params.get("From", "")
         if not message_sid or not sender_number:
             return Response(status_code=400)
@@ -167,15 +185,31 @@ def create_app(
             num_media = int(params.get("NumMedia") or 0)
         except ValueError:
             num_media = 0
-        inbound = Inbound(message_sid, sender_number, params.get("To", ""), params.get("Body", ""), num_media)
-        if service.store.claim_inbound(message_sid, service.store.sender_key(sender_number)):
-            background.add_task(process, inbound)
+        payload = {
+            "from": sender_number,
+            "to": params.get("To", ""),
+            "body": params.get("Body", ""),
+            "num_media": num_media,
+            "opt_out_type": params.get("OptOutType") or None,
+        }
+        if service.store.enqueue_inbound(message_sid, service.store.sender_key(sender_number), payload):
+            worker.wake()
         else:
             log.info("Ignored a redelivered message")
         return Response(content=EMPTY_TWIML, media_type="application/xml")
 
+    async def twilio_status(request: Request) -> Response:
+        params = await verified_params(request)
+        if params is None:
+            return Response(status_code=403)
+        provider_sid, status = params.get("MessageSid", ""), params.get("MessageStatus", "")
+        if provider_sid and status:
+            service.store.record_delivery(provider_sid, status.lower()[:20], params.get("ErrorCode") or None)
+        return Response(status_code=204)
+
     app.add_api_route("/twilio/sms", twilio_sms, methods=["POST"])
     app.add_api_route("/webhook", twilio_sms, methods=["POST"], include_in_schema=False)
+    app.add_api_route("/twilio/status", twilio_status, methods=["POST"])
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:

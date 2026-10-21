@@ -53,10 +53,27 @@ def test_token_and_app_are_mutually_exclusive():
     assert any("not both" in problem for problem in Settings.from_env(env).problems())
 
 
-def test_development_needs_no_secrets():
-    settings = Settings.from_env({"GIT_SMS_ENV": "development", "GIT_SMS_SENDER": "console"})
-    assert settings.problems() == []
-    assert settings.effective_secret_key
+def test_development_needs_no_secrets_but_unsigned_ingress_is_explicit():
+    base = {"GIT_SMS_ENV": "development", "GIT_SMS_SENDER": "console"}
+    assert any("GIT_SMS_ALLOW_UNSIGNED" in p for p in Settings.from_env(base).problems())
+    assert Settings.from_env({**base, "TWILIO_AUTH_TOKEN": "t"}).problems() == []
+    unsigned = Settings.from_env({**base, "GIT_SMS_ALLOW_UNSIGNED": "true"})
+    assert unsigned.problems() == [] and unsigned.effective_secret_key
+    contradictory = {**base, "GIT_SMS_ALLOW_UNSIGNED": "true", "TWILIO_AUTH_TOKEN": "t"}
+    assert any("contradictory" in p for p in Settings.from_env(contradictory).problems())
+
+
+def test_production_refuses_confirmation_free_writes_and_unsigned_ingress():
+    """GS-03: the confirmation code is the defence against spoofed sender numbers."""
+    no_confirm = Settings.from_env({**PRODUCTION, "GIT_SMS_CONFIRM_WRITES": "false"}).problems()
+    assert any("GIT_SMS_CONFIRM_WRITES=false is for development only" in p for p in no_confirm)
+    unsigned = Settings.from_env({**PRODUCTION, "GIT_SMS_ALLOW_UNSIGNED": "true"}).problems()
+    assert any("GIT_SMS_ALLOW_UNSIGNED is for development only" in p for p in unsigned)
+
+
+def test_retention_must_not_outlive_the_audit_log():
+    env = {**PRODUCTION, "GIT_SMS_RETENTION_DAYS": "90", "GIT_SMS_AUDIT_RETENTION_DAYS": "30"}
+    assert any("AUDIT_RETENTION" in p for p in Settings.from_env(env).problems())
 
 
 def test_private_key_file_and_escaped_newlines(tmp_path):
@@ -90,7 +107,9 @@ def test_a_model_must_be_named_explicitly():
 
 @pytest.mark.parametrize("name", ["GITHUB_MODELS_TOKEN", "GITHUB_OPENAI_API_KEY", "GITHUB_MODELS_MODEL"])
 def test_retired_github_models_settings_are_refused(name):
-    settings = Settings.from_env({name: "x", "GIT_SMS_ENV": "development", "GIT_SMS_SENDER": "console"})
+    settings = Settings.from_env(
+        {name: "x", "GIT_SMS_ENV": "development", "GIT_SMS_SENDER": "console", "GIT_SMS_ALLOW_UNSIGNED": "true"}
+    )
     assert not settings.llm_configured
     assert any("GitHub Models was retired" in problem and name in problem for problem in settings.problems())
 

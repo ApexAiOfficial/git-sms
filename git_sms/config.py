@@ -62,6 +62,7 @@ class Settings:
     twilio_messaging_service_sid: str | None = None
     sender_backend: str = "twilio"
     dev_outbox: str | None = None
+    allow_unsigned: bool = False
 
     github_api_url: str = "https://api.github.com"
     github_token: str | None = None
@@ -81,6 +82,10 @@ class Settings:
     max_writes_per_day: int = 20
     max_segments_per_reply: int = 3
     max_segments_per_day: int = 300
+    max_ai_calls_per_day: int = 200
+    retention_days: int = 30
+    audit_retention_days: int = 365
+    workers: int = 4
 
     @property
     def is_development(self) -> bool:
@@ -130,6 +135,7 @@ class Settings:
             twilio_messaging_service_sid=_str(env, "TWILIO_MESSAGING_SERVICE_SID"),
             sender_backend=(_str(env, "GIT_SMS_SENDER") or "twilio").lower(),
             dev_outbox=_str(env, "GIT_SMS_DEV_OUTBOX"),
+            allow_unsigned=_bool(env, "GIT_SMS_ALLOW_UNSIGNED", False),
             github_api_url=(_str(env, "GITHUB_API_URL") or "https://api.github.com").rstrip("/"),
             github_token=_str(env, "GITHUB_TOKEN"),
             github_app_id=_str(env, "GITHUB_APP_ID"),
@@ -146,6 +152,10 @@ class Settings:
             max_writes_per_day=_int(env, "GIT_SMS_MAX_WRITES_PER_DAY", 20, minimum=0),
             max_segments_per_reply=_int(env, "GIT_SMS_MAX_SEGMENTS_PER_REPLY", 3, minimum=1),
             max_segments_per_day=_int(env, "GIT_SMS_MAX_SEGMENTS_PER_DAY", 300, minimum=1),
+            max_ai_calls_per_day=_int(env, "GIT_SMS_MAX_AI_CALLS_PER_DAY", 200, minimum=0),
+            retention_days=_int(env, "GIT_SMS_RETENTION_DAYS", 30, minimum=1),
+            audit_retention_days=_int(env, "GIT_SMS_AUDIT_RETENTION_DAYS", 365, minimum=1),
+            workers=_int(env, "GIT_SMS_WORKERS", 4, minimum=1),
         )
 
     def problems(self) -> list[str]:
@@ -169,6 +179,22 @@ class Settings:
                 found.append("GIT_SMS_USERS_FILE is required")
             if self.sender_backend != "twilio":
                 found.append("the console sender is for development only")
+            if not self.confirm_writes:
+                found.append(
+                    "GIT_SMS_CONFIRM_WRITES=false is for development only: the confirmation code is what stops "
+                    "a spoofed sender number from changing GitHub"
+                )
+            if self.allow_unsigned:
+                found.append("GIT_SMS_ALLOW_UNSIGNED is for development only")
+
+        if self.allow_unsigned and self.twilio_auth_token:
+            found.append("GIT_SMS_ALLOW_UNSIGNED and TWILIO_AUTH_TOKEN are contradictory; unset one")
+        if self.is_development and not self.allow_unsigned and not self.twilio_auth_token:
+            found.append(
+                "TWILIO_AUTH_TOKEN is required to verify webhooks (development may set GIT_SMS_ALLOW_UNSIGNED=true)"
+            )
+        if self.audit_retention_days < self.retention_days:
+            found.append("GIT_SMS_AUDIT_RETENTION_DAYS must be at least GIT_SMS_RETENTION_DAYS")
 
         if self.sender_backend == "twilio" and not (
             self.twilio_account_sid
