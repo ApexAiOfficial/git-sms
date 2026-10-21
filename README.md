@@ -2,24 +2,73 @@
 
 Idea: Enabling GitHub collaboration, automation, and AI interaction via SMS text messages.
 
-> **DISCLAIMER:** Proof-of-concept, insecure by design, do not use in production, not a GitHub product. **As-Is, At Your Own Risk.**
+> **Status:** pre-1.0 community fork of [github/git-sms](https://github.com/github/git-sms). Not a GitHub product.
+> Provided as-is under the MIT license. Read [SECURITY.md](SECURITY.md) before you deploy it.
 
-## Current implementation
+Text a phone number, work on GitHub:
 
-The executable proof of concept supports `help`, repository summaries, latest-issue summaries, numbered-issue summaries, optional natural-language interpretation of that read-only set, and TwiML replies for a Twilio webhook.
+```text
+you > use acme/field-reports
+git > Default repo is now acme/field-reports. Try ISSUES or ISSUE #1.
+you > new issue Pump 3 leaks -- Water on the floor near pump 3 since 6am
+git > Reply CONFIRM 4821 within 10 min to open an issue in acme/field-reports: "Pump 3 leaks". ABORT drops it.
+you > confirm 4821
+git > Created acme/field-reports#57: https://github.com/acme/field-reports/issues/57
+```
 
-Repository and issue creation remain intentionally disabled. The application imports and starts without credentials; AI-dependent commands return a useful configuration message until GitHub Models or OpenAI is configured.
+## What works today
 
-## Security model
+| Command | What it does |
+| --- | --- |
+| `COMMANDS`, `COMMANDS <name>` | List commands, or explain one |
+| `USE owner/repo` | Set a default repository, so `#12` works on its own |
+| `REPO [owner/repo]` | Description, stars, open work, language, link |
+| `ISSUES [owner/repo] [open\|closed\|all]` | Recent issues (pull requests excluded) |
+| `ISSUE owner/repo#12` | One issue: state, author, labels, excerpt, link |
+| `PRS [owner/repo]`, `PR owner/repo#5` | Open pull requests; one pull request with branch, size and mergeability |
+| `SEARCH words` | Find repositories |
+| `SUMMARIZE owner/repo`, `SUMMARIZE owner/repo#12` | AI summary of a README or a whole issue/PR thread (optional) |
+| `NEW ISSUE [owner/repo] Title -- details` | Open an issue (asks for confirmation) |
+| `COMMENT owner/repo#12 text` | Comment on an issue or pull request (asks for confirmation) |
+| `CLOSE` / `REOPEN owner/repo#12` | Change state (asks for confirmation) |
+| `CONFIRM 1234`, `ABORT` | Approve or drop the waiting change |
+| `MORE`, `WHOAMI` | Next page of a long reply; your alias and access |
 
-The current implementation does not yet provide Twilio signature verification, sender authorization, replay protection, idempotency, rate limiting, durable auditing, GitHub App authentication, or SMS-triggered Actions. These controls must exist before enabling writes or workflow dispatch.
+Free-form messages ("what's broken in field reports?") are optionally rewritten into one of these commands by a
+language model, and the reply shows how it was understood. A model can never run anything outside this grammar,
+and anything that changes GitHub always needs the confirmation code.
 
-## Roadmap
+Command words avoid the carrier keywords (`HELP`, `INFO`, `STOP`, `CANCEL`, `END`, `QUIT`, `YES`, `START`...): Twilio
+answers or acts on those itself before the webhook sees them. The original `help` command therefore never reached
+the prototype; `COMMANDS` replaces it.
 
-1. Authenticate and constrain inbound SMS requests.
-2. Add idempotency, rate limits, and audit records.
-3. Introduce a least-privilege GitHub App.
-4. Demonstrate one allowlisted `workflow_dispatch` command with run tracking.
+## How it stays safe
+
+Every message passes, in order: a valid **Twilio signature** for the exact public URL; a one-time **MessageSid**
+claim (redelivery is a no-op); **opt-out** state; an operator-owned **sender directory** (unknown numbers get
+silence); per-sender and global **rate and spend limits**; explicit **repository grants**; and, for any write, a
+**confirmation code** that only the registered handset receives. That last step also defeats a spoofed sender
+number. Writes run under a least-privilege **GitHub App** installation token (or a fine-grained token) and are
+attributed on GitHub to the sender's alias, never their number. The database stores keyed hashes, not phone
+numbers, and every decision is audited. Details: [SECURITY.md](SECURITY.md) and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Getting started
+
+See [SETUP.md](SETUP.md): about 15 minutes with a Twilio number, a GitHub App (or token) and any host that can
+serve HTTPS. A [Dockerfile](Dockerfile) is included.
+
+## Status and roadmap
+
+- **Done (0.2):** secure webhook edge, sender directory and grants, confirmed issue/comment/close/reopen,
+  deterministic read commands, SMS-aware paging, optional AI summaries and natural-language routing, audit log,
+  242 automated tests, and a live end-to-end harness against a real GitHub repository.
+- **Next:** carrier-delivered verification on a registered sender (toll-free verification or A2P 10DLC), delivery
+  status tracking, a GitHub App setup helper, optional per-user PINs.
+- **Then:** allowlisted `workflow_dispatch` (`RUN deploy staging`) with run tracking, SMS notifications for
+  watched issues, and an optional Android SMS-gateway transport for deployments without an SMS provider.
+
+The full plan and its reasoning are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#roadmap).
 
 ## What It Is
 
@@ -88,11 +137,7 @@ This project can be adapted for a wide variety of scenarios, from individual dev
 
 [Prototype Simulation](https://gh.io/git-sms-simulation)
 
-## Setup
-
-[Step-by-step Proof of Concept](SETUP.md)
-
-## Maintainers
+## Original maintainers
 
 - [Ashley Wolf](https://github.com/ashleywolf)
 - [Dan Velton](https://github.com/dvelton)
