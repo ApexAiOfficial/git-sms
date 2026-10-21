@@ -72,16 +72,27 @@ def test_private_key_file_and_escaped_newlines(tmp_path):
 @pytest.mark.parametrize(
     ("env", "base", "model"),
     [
-        ({"GITHUB_MODELS_TOKEN": "g"}, "https://models.github.ai/inference", "openai/gpt-4o-mini"),
-        ({"GITHUB_OPENAI_API_KEY": "g"}, "https://models.github.ai/inference", "openai/gpt-4o-mini"),
-        ({"OPENAI_API_KEY": "o"}, "https://api.openai.com/v1", "gpt-4o-mini"),
         ({"OPENAI_API_KEY": "o", "OPENAI_MODEL": "gpt-x"}, "https://api.openai.com/v1", "gpt-x"),
+        ({"OPENAI_API_KEY": "o", "LLM_MODEL": "gpt-y"}, "https://api.openai.com/v1", "gpt-y"),
         ({"LLM_API_KEY": "l", "LLM_BASE_URL": "https://llm.local/v1/", "LLM_MODEL": "m"}, "https://llm.local/v1", "m"),
     ],
 )
 def test_llm_provider_resolution(env, base, model):
     settings = Settings.from_env(env)
     assert (settings.llm_base_url, settings.llm_model, settings.llm_configured) == (base, model, True)
+
+
+def test_a_model_must_be_named_explicitly():
+    settings = Settings.from_env({"OPENAI_API_KEY": "o"})
+    assert not settings.llm_configured
+    assert any("LLM_MODEL" in problem for problem in settings.problems())
+
+
+@pytest.mark.parametrize("name", ["GITHUB_MODELS_TOKEN", "GITHUB_OPENAI_API_KEY", "GITHUB_MODELS_MODEL"])
+def test_retired_github_models_settings_are_refused(name):
+    settings = Settings.from_env({name: "x", "GIT_SMS_ENV": "development", "GIT_SMS_SENDER": "console"})
+    assert not settings.llm_configured
+    assert any("GitHub Models was retired" in problem and name in problem for problem in settings.problems())
 
 
 def test_no_llm_by_default():

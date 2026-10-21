@@ -62,7 +62,7 @@ serve HTTPS. A [Dockerfile](Dockerfile) is included.
 
 - **Done (0.2):** secure webhook edge, sender directory and grants, confirmed issue/comment/close/reopen,
   deterministic read commands, SMS-aware paging, optional AI summaries and natural-language routing, audit log,
-  242 automated tests, and a live end-to-end harness against a real GitHub repository.
+  244 automated tests, and a live end-to-end harness against a real GitHub repository.
 - **Next:** carrier-delivered verification on a registered sender (toll-free verification or A2P 10DLC), delivery
   status tracking, a GitHub App setup helper, optional per-user PINs.
 - **Then:** allowlisted `workflow_dispatch` (`RUN deploy staging`) with run tracking, SMS notifications for

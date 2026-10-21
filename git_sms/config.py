@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+RETIRED_LLM_SETTINGS = ("GITHUB_MODELS_TOKEN", "GITHUB_OPENAI_API_KEY", "GITHUB_MODELS_MODEL")
 DEVELOPMENT_SECRET = "development-only-secret-key"  # noqa: S105 - refused outside development
 
 
@@ -72,6 +73,7 @@ class Settings:
     llm_api_key: str | None = None
     llm_model: str | None = None
     natural_language: bool = True
+    retired_llm_settings: tuple[str, ...] = ()
 
     confirm_writes: bool = True
     confirmation_ttl_seconds: int = 600
@@ -108,17 +110,11 @@ class Settings:
 
         llm_base_url = _str(env, "LLM_BASE_URL")
         llm_api_key = _str(env, "LLM_API_KEY")
-        llm_model = _str(env, "LLM_MODEL")
-        github_models_key = _str(env, "GITHUB_MODELS_TOKEN", "GITHUB_OPENAI_API_KEY")
+        llm_model = _str(env, "LLM_MODEL", "OPENAI_MODEL")
         openai_key = _str(env, "OPENAI_API_KEY")
-        if not llm_api_key and github_models_key:
-            llm_api_key = github_models_key
-            llm_base_url = llm_base_url or "https://models.github.ai/inference"
-            llm_model = llm_model or _str(env, "GITHUB_MODELS_MODEL") or "openai/gpt-4o-mini"
-        elif not llm_api_key and openai_key:
+        if not llm_api_key and openai_key:
             llm_api_key = openai_key
             llm_base_url = llm_base_url or "https://api.openai.com/v1"
-            llm_model = llm_model or _str(env, "OPENAI_MODEL") or "gpt-4o-mini"
 
         environment = (_str(env, "GIT_SMS_ENV") or "production").lower()
         return cls(
@@ -143,6 +139,7 @@ class Settings:
             llm_api_key=llm_api_key,
             llm_model=llm_model,
             natural_language=_bool(env, "GIT_SMS_NATURAL_LANGUAGE", True),
+            retired_llm_settings=tuple(name for name in RETIRED_LLM_SETTINGS if _str(env, name)),
             confirm_writes=_bool(env, "GIT_SMS_CONFIRM_WRITES", True),
             confirmation_ttl_seconds=_int(env, "GIT_SMS_CONFIRMATION_TTL_SECONDS", 600, minimum=60),
             max_commands_per_hour=_int(env, "GIT_SMS_MAX_COMMANDS_PER_HOUR", 30, minimum=1),
@@ -184,6 +181,15 @@ class Settings:
             found.append("GitHub App auth needs GITHUB_APP_ID, a private key and GITHUB_APP_INSTALLATION_ID")
         if all(app_fields) and self.github_token:
             found.append("configure either GITHUB_TOKEN or a GitHub App, not both")
+
+        if self.retired_llm_settings:
+            found.append(
+                f"{', '.join(self.retired_llm_settings)}: GitHub Models was retired on 2026-07-30; "
+                "use OPENAI_API_KEY or LLM_BASE_URL/LLM_API_KEY, plus LLM_MODEL"
+            )
+        llm_parts = (self.llm_base_url, self.llm_api_key, self.llm_model)
+        if any(llm_parts) and not all(llm_parts):
+            found.append("an AI model needs LLM_BASE_URL (or OPENAI_API_KEY), an API key and LLM_MODEL")
         return found
 
     def validate(self) -> None:
