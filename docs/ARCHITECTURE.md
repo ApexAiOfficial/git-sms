@@ -147,13 +147,26 @@ A third review of `55e536a` (2026-10-21) raised two P2s; both reproduce on `55e5
 | Queue capacity was checked apart from the insert | Confirmed as latent: in the documented single process the async handler does not yield between them, but two processes on one file overflow | Check and insert are one transaction (tested with four writers on one file) |
 | Not in the review: a redelivered message got 503 while the queue was full | Confirmed | Duplicates are recognised before capacity |
 
+The final acceptance review of `d7ed1e6` approved merging as a development foundation and raised one minor P2:
+observed (unproven) state changes were missing from `git-sms status` and the health counts. Fixed in `89c342a`
+with a regression that fails on `d7ed1e6`. Merged to `main` as `3e7ebb6` on 2026-10-22.
+
 ## Roadmap
 
-1. **Carrier-verified operation.** A dedicated sender with toll-free verification or A2P 10DLC registration,
-   Twilio status callbacks for delivery tracking, and a recorded live run from a real handset.
-2. **Operator experience.** A GitHub App manifest helper, an audit export command, retention settings, and an
-   optional per-user PIN for writes.
-3. **Automation.** Allowlisted `workflow_dispatch` (`RUN deploy staging`) with per-user grants, confirmation, and
+Validation milestones come first; none has been done yet:
+
+1. **Carrier-delivered SMS.** A dedicated sender with toll-free verification or A2P 10DLC registration, and a
+   recorded run in both directions from a real handset, with Twilio's message log and delivery callbacks as
+   independent evidence.
+2. **A real GitHub App.** Install the least-privilege App described in SETUP.md on a test repository and observe
+   every write, including whether commenting on a pull request needs more than the Issues permission.
+3. **A live AI provider.** Exercise summaries and free-form routing against an OpenAI-compatible endpoint.
+
+Then:
+
+4. **Operator experience.** A GitHub App manifest helper, an audit export command, and an optional per-user PIN
+   for writes.
+5. **Automation.** Allowlisted `workflow_dispatch` (`RUN deploy staging`) with per-user grants, confirmation, and
    run-status follow-up by SMS; subscriptions that text watched issue and pull-request updates.
-4. **Reach.** Localised replies, and an optional Android SMS-gateway transport for communities that have a phone
+6. **Reach.** Localised replies, and an optional Android SMS-gateway transport for communities that have a phone
    and a data connection but no SMS provider account.
