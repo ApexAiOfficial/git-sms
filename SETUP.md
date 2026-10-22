@@ -82,7 +82,9 @@ GIT_SMS_HOST=0.0.0.0 PORT=8000 python -m git_sms
 ```
 
 Put it behind your HTTPS reverse proxy (or a tunnel) so that `GIT_SMS_PUBLIC_URL` + `/twilio/sms` and
-`/twilio/status` reach it. `GET /healthz` reports liveness. Run one process per database file: the worker pool
+`/twilio/status` reach it. `GET /healthz` reports liveness; `GET /readyz` returns 503 if the worker has stopped or
+a queue has stalled for two minutes, with counts (never identifiers) of waiting messages, replies and unsettled
+writes. Run one process per database file: the worker pool
 inside it (`GIT_SMS_WORKERS`, default 4) is what processes the queue.
 
 Keep `.env`, the users file and the database directory readable only by the service account. Back the database
@@ -93,6 +95,16 @@ sqlite3 /var/lib/git-sms/git-sms.db ".backup '/backups/git-sms-$(date +%F).db'"
 ```
 
 A backup is only readable with the same `GIT_SMS_SECRET_KEY`; store that key separately.
+
+### When a write's outcome is unknown
+
+If GitHub times out or fails mid-write, Git SMS never retries it. Run these with the server's environment:
+
+```bash
+python -m git_sms status      # queue health, and every write not yet settled (exit 1 if any is unknown)
+python -m git_sms reconcile   # look for unknown writes on GitHub and settle those found
+python -m git_sms resolve OP_ID done https://github.com/owner/repo/issues/7   # or: resolve OP_ID failed
+```
 
 ## 6. Point Twilio at it
 

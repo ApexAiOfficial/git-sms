@@ -41,11 +41,13 @@ Twilio ──POST /twilio/sms──▶ app.py (HTTP edge)
                                     parse (grammar; optional LLM rewrite → re-parse, daily AI budget)
                                     repository grant (read / write; search results filtered)
                                     reads  ─▶ GitHub REST ─▶ SMS text
-                                    writes ─▶ code to the real handset ─▶ CONFIRM (atomic take)
-                                             ─▶ journal op ─▶ GitHub (with hidden marker) ─▶ done | failed | unknown
+                                    writes ─▶ code to the real handset ─▶ CONFIRM: take the code and journal
+                                             the intent in one transaction ─▶ executing (once) ─▶ GitHub
+                                             (issues and comments carry a hidden marker) ─▶ done | failed | unknown
                               6. commit replies to the outbound ledger, retire the message
-                              7. send: daily segment budget ─▶ Twilio REST (SID recorded)
-Twilio ──POST /twilio/status─▶ delivery status recorded against the SID
+                              7. send (replies before new inbound work; one in flight per sender, in order):
+                                    daily segment budget ─▶ Twilio REST (SID recorded)
+Twilio ──POST /twilio/status─▶ delivery status recorded against the SID (only ever advances)
 ```
 
 | Module | Responsibility |
@@ -67,9 +69,12 @@ Twilio ──POST /twilio/status─▶ delivery status recorded against the SID
 | --- | --- | --- |
 | Acknowledged inbound message | At least once | Committed before the 200; re-queued after a crash; given up after 3 failed attempts |
 | One sender's messages | Processed in arrival order | A sender's next message is claimed only when none of theirs is in progress |
-| GitHub write | At most once | Journalled against the triggering MessageSid before the call; re-processing reports or reconciles |
-| Write GitHub did not confirm | Reported as unknown, never retried | Reconciled by its hidden marker when the message is re-processed; the sender is told to check |
-| Reply | At most once after a send starts | Retried only when Twilio certainly did not accept it (429, 503, connect timeout); otherwise recorded |
+| Confirmed write | Never lost | The code is accepted and the write journalled as an approved intent in one transaction |
+| GitHub write | At most once | An intent moves to executing exactly once, before the call; re-processing reports or reconciles |
+| Write GitHub did not confirm | Reported as unknown, never retried | Reconciled by its marker (issues, comments) or target state (unproven); operators settle the rest |
+| Reply | At most once after a send starts | Retried only when Twilio certainly did not accept it (429, connect timeout); any 5xx is unknown |
+| One sender's replies | Handed to Twilio in order, one at a time | A reply is claimed only when none of the same sender's earlier replies is waiting or in flight |
+| Delivery status | Monotonic | Callbacks may repeat or arrive early or late; a status only moves forward |
 
 At-least-once intake is safe because the only effects that matter, GitHub writes, are made at most once by the
 journal; the worst case is a read answered twice after a crash.
@@ -85,8 +90,9 @@ journal; the worst case is a read answered twice after a crash.
 3. **Queue durably, acknowledge, then reply over the REST API.** The webhook does one small transaction, which
    keeps it far inside Twilio's timeout and makes a crash after the 200 recoverable.
 4. **Journal writes; never replay an uncertain one.** Issue and comment creation are not idempotent on GitHub.
-   Rather than retry, each write is keyed to its triggering message and carries a marker that reconciliation can
-   find, and an unconfirmed outcome is surfaced to the person who asked.
+   Each write is journalled as an intent in the same transaction that accepts its confirmation, attempted at most
+   once, and keyed to its triggering message; issues and comments carry a marker that reconciliation can find,
+   and an unconfirmed outcome is surfaced to the person who asked and to the operator.
 5. **SQLite, one process, a worker pool.** The workload is a few messages a minute. One file to back up keeps the
    service independently deployable anywhere, and every store method is one transaction.
 6. **Least-privilege GitHub identity.** GitHub App installation tokens are the recommended path; user grants are
@@ -118,6 +124,20 @@ that fails on `9fa5797`.
 | GS-11 dev mode and release hardening | Partly | Unsigned ingress needs an explicit dev-only flag; CI builds and installs the wheel and audits dependencies. Live reverse-proxy and Twilio validation remain carrier-test work |
 | GS-14 first-page-only issue and comment reads | Confirmed | Bounded multi-page reads |
 | Not in the review: a write timeout told the user "Try again" | Confirmed | Unknown-outcome reply, and a duplicate warning before an identical write |
+
+A second review of `1f981ed` (2026-10-21) confirmed the first three were fixed and raised these; each has a
+regression test (deterministic fault injection for P1-01) that fails on `1f981ed`.
+
+| Finding | Verdict | Resolution |
+| --- | --- | --- |
+| P1-01 a crash between taking the confirmation and journalling the write loses it | Confirmed | One transaction turns the pending change into a journalled intent; intents are attempted once |
+| P1/P2-02 a Twilio 503 was retried as certainly unaccepted | Confirmed | Every 5xx is treated as possibly accepted and never resent |
+| P2-03 one sender's replies could be sent concurrently, out of order | Confirmed | Per-sender, in-order, one-in-flight send hand-off |
+| P2-04 delivery callbacks could arrive early or regress a status | Confirmed | Monotonic delivery state, early callbacks kept until the SID is recorded |
+| P2-05 inbound work could starve replies; unknown senders filled the queue | Confirmed | Replies first; unknown senders not queued; bounded queue refuses with 503 |
+| P2-06 health said nothing about the worker or stuck work | Confirmed | `/readyz`, and `git-sms status`, `reconcile` and `resolve` |
+| P2-07 "every write carries a marker" was too broad | Confirmed (docs and wording) | State changes are reconciled by state and reported as unproven |
+| Not in the review: Twilio's `sending` status shared the send-lifecycle column | Confirmed | Delivery status moved to its own column; recovery and ordering ignore it |
 
 ## Roadmap
 

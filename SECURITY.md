@@ -16,15 +16,16 @@ meets them:
 | --- | --- |
 | Forged webhook (anyone can POST to a public URL) | `X-Twilio-Signature` verified with the account auth token against the configured public URL; the `AccountSid` must match. Production refuses to start without these; unsigned ingress needs an explicit, development-only `GIT_SMS_ALLOW_UNSIGNED`. Delivery-status callbacks are verified the same way. |
 | An acknowledged message is lost in a crash | The message is committed (encrypted) to the SQLite intake queue before Twilio receives its 200. Messages interrupted mid-processing are re-queued on restart; one that keeps failing is given up after three attempts. |
-| A redelivered webhook, a crash or a retry repeats a write | Each `MessageSid` is queued once. Every write is journalled against the message that triggered it before it is attempted, and carries a hidden `<!-- git-sms:... -->` marker, so re-processing reports or reconciles the earlier write instead of repeating it. |
-| A write's outcome is unknown (timeout, dropped connection, GitHub 5xx) | Recorded as `unknown` and never retried automatically. The sender is told to check GitHub first, and an identical later request is flagged as a possible duplicate before it can be confirmed. |
-| Messages from one sender processed out of order | One sender's messages run strictly in arrival order; different senders run in parallel. |
+| A crash loses a confirmed change | Accepting the confirmation code and journalling the write as an approved intent are one transaction, so a crash at any later point leaves the intent to be attempted after restart. |
+| A redelivered webhook, a crash or a retry repeats a write | Each `MessageSid` is queued once. An approved intent moves to "executing" exactly once, just before GitHub is called, and is never attempted again: re-processing reports the result or reconciles it. New issues and comments carry a hidden `<!-- git-sms:... -->` marker that proves whether they landed. |
+| A write's outcome is unknown (timeout, dropped connection, GitHub 5xx, a crash during the call) | Recorded as `unknown` and never retried automatically. The sender is told to check GitHub first, an identical later request is flagged as a possible duplicate, and operators can see and settle these writes with `git-sms status`, `reconcile` and `resolve`. |
+| Messages or replies out of order | One sender's messages run strictly in arrival order, and their replies are handed to Twilio one at a time in the order written; different senders run in parallel. (Carriers do not guarantee delivery order.) |
 | Unknown sender | Operator-owned directory; unknown numbers get no reply (or read-only public access if `public_read` is enabled, using an anonymous GitHub client and no AI). |
 | Spoofed sender number | Every write needs a one-time 4-digit code sent to the registered number, bound to that sender, valid for 10 minutes, dropped after 3 wrong tries, and checked and consumed in one atomic step. A spoofer never sees the code. Production cannot disable confirmation. |
 | Over-broad access | Per-user repository grants for read and write, applied to every read (search results included) and re-checked at confirmation; a GitHub App installation (or fine-grained token) bounds the credential itself. Pull request state changes are refused. |
 | Prompt injection via the language model | The model only proposes one line, which is re-parsed by the deterministic grammar and authorised like typed input. It cannot confirm, and any write it proposes always needs the code. Repository content sent for summaries is delimited as untrusted data and the output is only text. |
 | Abuse and runaway cost | Per-sender hourly message limit (one notice, then silence), per-sender daily write limit, a global daily outbound-segment ceiling (refunded when a send certainly failed), a global daily AI call budget, no AI for guests, paging instead of long messages, and no reply to opt-out keywords or Twilio's `OptOutType` messages. |
-| Slow dependencies | Webhooks are acknowledged as soon as they are queued; GitHub, model and Twilio calls have bounded timeouts. A reply whose send may have reached Twilio is never resent. |
+| Slow or failing dependencies | Webhooks are acknowledged as soon as they are queued; GitHub, model and Twilio calls have bounded timeouts. A reply whose send may have reached Twilio (any 5xx, a timeout, a crash mid-send) is never resent; only a 429 or a connection that never opened is retried. Delivery callbacks may repeat or arrive out of order: a status only ever advances. Replies are sent before more inbound work is taken, unknown senders never occupy the queue, and a full queue refuses webhooks (503) instead of acknowledging what it cannot hold. `/readyz` reports a stopped worker or a stalled queue. |
 
 ## What is stored, and where
 
@@ -53,6 +54,10 @@ meets them:
 - A stolen or SIM-swapped phone can confirm writes within its grants. Keep write grants narrow; an optional
   per-user PIN is on the roadmap.
 - Reconciliation looks for the write's marker on GitHub. If someone deletes the issue or edits the marker away,
-  the outcome stays `unknown`, which is the safe answer.
+  the outcome stays `unknown`, which is the safe answer. A state change (`CLOSE`, `REOPEN`) carries no marker:
+  finding the issue in the target state settles the write but is reported as unproven, since someone else may
+  have changed it.
+- If the process dies after a write was marked "executing" but before GitHub was called, nothing was written but
+  the outcome is still reported as unknown. That is the price of never writing twice.
 - Delivery receipts depend on Twilio's status callbacks reaching `GIT_SMS_PUBLIC_URL/twilio/status`.
 - Git SMS has not yet been validated against real carrier traffic; see [docs/TESTING.md](docs/TESTING.md).
