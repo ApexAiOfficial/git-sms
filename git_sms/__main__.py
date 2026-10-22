@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 
 import uvicorn
 
+NEEDS_OPERATOR = {"unknown", "observed"}
+
 
 def _service():
     from git_sms.app import build_service
@@ -43,13 +45,17 @@ def status() -> int:
     for op in unsettled:
         target = f"{op.repo}#{op.number}" if op.number else op.repo
         print(f"{op.op_id}  {op.status:<9}  {op.action:<16}  {target}  since {_when(op.created_at)}")
-    return 1 if any(op.status == "unknown" for op in unsettled) else 0
+    return 1 if any(op.status in NEEDS_OPERATOR for op in unsettled) else 0
 
 
 def reconcile() -> int:
     service = _service()
     remaining = 0
     for op in service.store.unresolved_operations():
+        if op.status == "observed":
+            remaining += 1
+            print(f"{op.op_id}  observed: target state seen, not proven; check {op.url} and run resolve")
+            continue
         if op.status != "unknown":
             continue  # confirmed and executing writes belong to the running server
         found = service.reconcile(op)
