@@ -1,0 +1,23 @@
+.env
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.vscode/
+.idea/
+.DS_Store
+# Runtime state and private configuration
+*.db
+*.db-shm
+*.db-wal
+users.toml
+*.pem
+outbox.jsonl

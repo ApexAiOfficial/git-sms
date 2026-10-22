@@ -1,0 +1,17 @@
+# Git SMS sender directory. Keep the real file private: it holds phone numbers.
+# Numbers below are fictional.
+
+# true: unknown numbers may run read-only commands on public repositories, anonymously.
+# false (default): unknown numbers get no reply at all.
+public_read = false
+
+[[users]]
+phone = "+15550100001"          # E.164, exactly as Twilio reports it in From
+alias = "ana"                   # shown on GitHub and in the audit log instead of the number
+read = ["*"]                    # repository patterns: "*", "owner/*", "owner/repo", "owner/docs-*"
+write = ["my-org/field-reports"]
+
+[[users]]
+phone = "+15550100002"
+alias = "sam"
+read = ["my-org/*"]             # read-only
