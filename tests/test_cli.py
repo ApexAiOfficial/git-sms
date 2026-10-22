@@ -55,7 +55,9 @@ def test_reconcile_settles_writes_found_by_their_marker(service, api, capsys):
 def test_reconcile_reports_state_changes_as_unproven(service, capsys):
     op_id = unknown_write(service, action="SetState:open", number=12)
     assert cli.main(["reconcile"]) == 0
-    assert "target state only" in capsys.readouterr().out
+    assert "observed (target state only" in capsys.readouterr().out
+    assert service.store.operation(op_id).status == "observed"  # never "done": nothing proves this write did it
+    assert cli.main(["resolve", op_id, "done", "https://github.com/acme/field-reports/issues/12"]) == 0
     assert service.store.operation(op_id).status == "done"
 
 

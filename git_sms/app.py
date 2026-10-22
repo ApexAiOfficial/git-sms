@@ -196,9 +196,6 @@ def create_app(
                 outcome="ignored",
             )
             return Response(content=EMPTY_TWIML, media_type="application/xml")
-        if service.store.queue_depth() >= settings.max_queued:
-            log.error("Intake queue full (%d); refusing a webhook so Twilio records the failure", settings.max_queued)
-            return Response(status_code=503)
         payload = {
             "from": sender_number,
             "to": params.get("To", ""),
@@ -206,7 +203,13 @@ def create_app(
             "num_media": num_media,
             "opt_out_type": params.get("OptOutType") or None,
         }
-        if service.store.enqueue_inbound(message_sid, service.store.sender_key(sender_number), payload):
+        queued = service.store.enqueue_inbound(
+            message_sid, service.store.sender_key(sender_number), payload, max_waiting=settings.max_queued
+        )
+        if queued == "full":
+            log.error("Intake queue full (%d); refusing a webhook so Twilio records the failure", settings.max_queued)
+            return Response(status_code=503)
+        if queued == "queued":
             worker.wake()
         else:
             log.info("Ignored a redelivered message")

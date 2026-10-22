@@ -558,13 +558,16 @@ class Service:
             return f"Already done: {op.url}"
         if op.status == "failed":
             return "That change was not made."
+        if op.status == "observed":
+            return self._observed_reply(op, op.url)
         found = self.reconcile(op)
         if found is None:
             self.store.finish_operation(op.op_id, "unknown")
             return self._unknown_reply(op)
         url, proven = found
-        if proven:
-            return f"Done: {url}"
+        return f"Done: {url}" if proven else self._observed_reply(op, url)
+
+    def _observed_reply(self, op: Operation, url: str | None) -> str:
         state = op.action.split(":", 1)[1]
         return f"{op.repo}#{op.number} is {state} now, but GitHub did not confirm whether this request did it: {url}"
 
@@ -572,9 +575,10 @@ class Service:
         """Look for an unsettled write on GitHub; settle it if found.
 
         Returns (url, proven) or None when nothing was found, which is not proof the write failed.
-        Issues and comments carry this operation's hidden marker, so finding it is proof. A state
-        change carries no marker: the issue being in the target state is only evidence (someone
-        else may have changed it), so the operation is settled as done but reported as unproven.
+        Issues and comments carry this operation's hidden marker, so finding it is proof and the
+        operation becomes "done". A state change carries no marker: the issue being in the target
+        state is only evidence (someone else may have changed it), so the operation becomes
+        "observed", never "done", and every later report and audit entry says so.
         """
         marker = f"<!-- git-sms:{op.op_id} -->"
         since = _iso(op.created_at - RECONCILE_SLACK_SECONDS)
@@ -606,12 +610,12 @@ class Service:
             log.warning("Reconciliation lookup failed: %s", error)
             return None
         if found:
-            self.store.finish_operation(op.op_id, "done", found[0])
+            self.store.finish_operation(op.op_id, "done" if found[1] else "observed", found[0])
             self.store.audit(
                 sender_key="system",
                 action=op.action,
                 repo=op.repo,
-                outcome="reconciled" if found[1] else "reconciled_state",
+                outcome="reconciled" if found[1] else "observed_unproven",
                 url=found[0],
             )
         return found

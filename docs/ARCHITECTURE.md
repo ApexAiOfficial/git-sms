@@ -69,9 +69,9 @@ Twilio ──POST /twilio/status─▶ delivery status recorded against the SID 
 | --- | --- | --- |
 | Acknowledged inbound message | At least once | Committed before the 200; re-queued after a crash; given up after 3 failed attempts |
 | One sender's messages | Processed in arrival order | A sender's next message is claimed only when none of theirs is in progress |
-| Confirmed write | Never lost | The code is accepted and the write journalled as an approved intent in one transaction |
+| Confirmed write | Durably approved; not guaranteed to execute | The code is accepted and the write journalled as an approved intent in one transaction; the intent may still fail, end unknown, or, if its message is given up, wait as "approved, not attempted" for an operator |
 | GitHub write | At most once | An intent moves to executing exactly once, before the call; re-processing reports or reconciles |
-| Write GitHub did not confirm | Reported as unknown, never retried | Reconciled by its marker (issues, comments) or target state (unproven); operators settle the rest |
+| Write GitHub did not confirm | Reported as unknown, never retried | Reconciled by its marker (issues, comments: `done`) or target state (state changes: `observed`, never `done`); operators settle the rest |
 | Reply | At most once after a send starts | Retried only when Twilio certainly did not accept it (429, connect timeout); any 5xx is unknown |
 | One sender's replies | Handed to Twilio in order, one at a time | A reply is claimed only when none of the same sender's earlier replies is waiting or in flight |
 | Delivery status | Monotonic | Callbacks may repeat or arrive early or late; a status only moves forward |
@@ -138,6 +138,14 @@ regression test (deterministic fault injection for P1-01) that fails on `1f981ed
 | P2-06 health said nothing about the worker or stuck work | Confirmed | `/readyz`, and `git-sms status`, `reconcile` and `resolve` |
 | P2-07 "every write carries a marker" was too broad | Confirmed (docs and wording) | State changes are reconciled by state and reported as unproven |
 | Not in the review: Twilio's `sending` status shared the send-lifecycle column | Confirmed | Delivery status moved to its own column; recovery and ordering ignore it |
+
+A third review of `55e536a` (2026-10-21) raised two P2s; both reproduce on `55e536a` and have regressions.
+
+| Finding | Verdict | Resolution |
+| --- | --- | --- |
+| An unproven state change was recorded as `done`, so a replay answered "Already done" | Confirmed | New terminal state `observed`, audited `observed_unproven`, reported as unconfirmed on every replay; only an operator's `resolve` makes it `done` |
+| Queue capacity was checked apart from the insert | Confirmed as latent: in the documented single process the async handler does not yield between them, but two processes on one file overflow | Check and insert are one transaction (tested with four writers on one file) |
+| Not in the review: a redelivered message got 503 while the queue was full | Confirmed | Duplicates are recognised before capacity |
 
 ## Roadmap
 

@@ -25,8 +25,8 @@ def make(clock=None, path=":memory:"):
 def test_inbound_is_queued_once_and_claimed_in_order():
     store = make()
     a, b = store.sender_key(ALICE), store.sender_key(BOB)
-    assert store.enqueue_inbound("SM1", a, PAYLOAD)
-    assert not store.enqueue_inbound("SM1", a, PAYLOAD)
+    assert store.enqueue_inbound("SM1", a, PAYLOAD) == "queued"
+    assert store.enqueue_inbound("SM1", a, PAYLOAD) == "duplicate"
     store.enqueue_inbound("SM2", a, {**PAYLOAD, "body": "second"})
     store.enqueue_inbound("SM3", b, {**PAYLOAD, "from": BOB, "body": "bob"})
 
@@ -50,7 +50,7 @@ def test_concurrent_enqueue_admits_exactly_one(tmp_path):
         thread.start()
     for thread in threads:
         thread.join()
-    assert results.count(True) == 1
+    assert results.count("queued") == 1 and results.count("duplicate") == 15
 
 
 def test_concurrent_claims_never_run_one_sender_twice(tmp_path):
@@ -256,7 +256,7 @@ def test_sweep_applies_retention_but_keeps_unresolved_writes(clock):
         "audit": 0,
     }
     assert store.operation("unknown-op") is not None
-    assert store.enqueue_inbound("SM2", "k", PAYLOAD)  # the queue still works after a sweep
+    assert store.enqueue_inbound("SM2", "k", PAYLOAD) == "queued"  # the queue still works after a sweep
 
     clock.advance(366 * 86400)
     removed = store.sweep(retention_days=30, audit_retention_days=365)
@@ -382,3 +382,35 @@ def test_health_counts_without_identifiers(clock):
     assert health["inbound_waiting"] == 1 and health["oldest_inbound_seconds"] == 30
     assert health["writes_approved_unattempted"] == 1
     assert ALICE not in str(health)
+
+
+# Third review: atomic queue capacity ------------------------------------------------------
+
+
+def test_queue_capacity_holds_under_concurrent_writers_sharing_the_file(tmp_path):
+    """P2: the capacity check and the insert are one transaction, even across processes."""
+    path = str(tmp_path / "q.db")
+    stores = [make(path=path) for _ in range(4)]  # four processes on one database
+    results = []
+    barrier = threading.Barrier(24)
+
+    def offer(n):
+        barrier.wait()
+        results.append(stores[n % 4].enqueue_inbound(f"SM{n}", f"s{n}", PAYLOAD, max_waiting=5))
+
+    threads = [threading.Thread(target=offer, args=(n,)) for n in range(24)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results.count("queued") == 5 and results.count("full") == 19
+    assert stores[0].health()["inbound_waiting"] == 5
+
+
+def test_a_redelivery_is_recognised_even_when_the_queue_is_full():
+    store = make()
+    assert store.enqueue_inbound("SM1", "k", PAYLOAD, max_waiting=1) == "queued"
+    assert store.enqueue_inbound("SM2", "k", PAYLOAD, max_waiting=1) == "full"
+    assert store.enqueue_inbound("SM1", "k", PAYLOAD, max_waiting=1) == "duplicate"
+    store.complete_inbound(store.claim_inbound(), [])
+    assert store.enqueue_inbound("SM2", "k", PAYLOAD, max_waiting=1) == "queued"

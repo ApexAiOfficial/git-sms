@@ -67,7 +67,8 @@ CREATE TABLE operations (
     repo TEXT NOT NULL,
     number INTEGER,
     fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL,             -- confirmed (approved, not attempted), executing, done, failed, unknown
+    status TEXT NOT NULL,             -- confirmed (approved, not attempted), executing, done, failed, unknown,
+                                      -- observed (target state seen on GitHub, not proven to be this write)
     url TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -246,15 +247,28 @@ class Store:
 
     # Intake queue ------------------------------------------------------------------
 
-    def enqueue_inbound(self, message_sid: str, sender_key: str, payload: dict) -> bool:
-        """Durably queue a message before it is acknowledged; False means it was seen before."""
+    def enqueue_inbound(self, message_sid: str, sender_key: str, payload: dict, max_waiting: int | None = None) -> str:
+        """Durably queue a message before it is acknowledged.
+
+        Returns "queued", "duplicate" (seen before, even when the queue is full) or "full". The
+        capacity check and the insert are one transaction, so concurrent webhooks, even from
+        several processes sharing the file, can never push the queue past max_waiting.
+        """
         with self._transaction() as db:
-            cursor = db.execute(
-                "INSERT OR IGNORE INTO inbound (message_sid, sender_key, received_at, status, payload) "
+            if db.execute("SELECT 1 FROM inbound WHERE message_sid = ?", (message_sid,)).fetchone():
+                return "duplicate"
+            if max_waiting is not None:
+                waiting = db.execute(
+                    "SELECT count(*) FROM inbound WHERE status IN ('queued', 'processing')"
+                ).fetchone()[0]
+                if waiting >= max_waiting:
+                    return "full"
+            db.execute(
+                "INSERT INTO inbound (message_sid, sender_key, received_at, status, payload) "
                 "VALUES (?, ?, ?, 'queued', ?)",
                 (message_sid, sender_key, self._clock(), self._sealer.seal(payload, sender_key)),
             )
-            return cursor.rowcount == 1
+        return "queued"
 
     def claim_inbound(self) -> Job | None:
         """Take the oldest queued message whose sender has nothing in progress (per-sender FIFO)."""
@@ -295,12 +309,6 @@ class Store:
         with self._lock:
             row = self._db.execute("SELECT status FROM inbound WHERE message_sid = ?", (message_sid,)).fetchone()
         return row[0] if row else None
-
-    def queue_depth(self) -> int:
-        with self._lock:
-            return self._db.execute("SELECT count(*) FROM inbound WHERE status IN ('queued', 'processing')").fetchone()[
-                0
-            ]
 
     def recover(self) -> dict[str, int]:
         """After a restart: re-queue interrupted messages; never resend a reply whose send was in flight."""
@@ -479,7 +487,8 @@ class Store:
         with self._lock:
             row = self._db.execute(
                 f"SELECT {OPERATION_COLUMNS} FROM operations "  # noqa: S608
-                "WHERE sender_key = ? AND fingerprint = ? AND status IN ('done', 'unknown', 'executing', 'confirmed') "
+                "WHERE sender_key = ? AND fingerprint = ? "
+                "AND status IN ('done', 'observed', 'unknown', 'executing', 'confirmed') "
                 "AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
                 (sender_key, fingerprint, self._clock() - within_seconds),
             ).fetchone()
@@ -580,8 +589,10 @@ class Store:
 
         Returns ("ok", command), or ("none" | "expired" | "wrong" | "locked", None). The same
         transaction that consumes the pending change journals it as operation op_id in state
-        "confirmed", so a crash at any later point leaves a recoverable intent, never a lost
-        one. A command is returned at most once, and only for the code it was created with.
+        "confirmed", so a crash at any later point leaves the approval on record. Recording
+        the approval does not guarantee execution: the intent is attempted at most once and
+        may still fail or end unknown. A command is returned at most once, and only for the
+        code it was created with.
         """
         with self._transaction() as db:
             row = db.execute(
