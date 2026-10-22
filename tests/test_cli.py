@@ -78,3 +78,33 @@ def test_resolve_records_an_operator_verdict(service, capsys):
     assert service.store.audit_log()[0].outcome == "resolved_done"
     assert cli.main(["resolve", op_id, "failed"]) == 2  # already settled
     assert cli.main(["resolve", "no-such-op", "failed"]) == 2
+
+
+def observed_write(service, op_id="op-observed"):
+    key = service.store.sender_key(ALICE)
+    service.store.record_intent(op_id, key, "SetState:closed", "acme/field-reports", 12, "fp", {})
+    service.store.start_operation(op_id)
+    service.store.finish_operation(op_id, "observed", "https://github.com/acme/field-reports/issues/12")
+    return op_id
+
+
+def test_observed_writes_stay_visible_until_an_operator_resolves_them(service, capsys):
+    """Final review: an unproven state change must not drop out of operator status."""
+    op_id = observed_write(service)
+    assert [op.op_id for op in service.store.unresolved_operations()] == [op_id]
+    assert service.store.health()["writes_observed_unproven"] == 1
+
+    assert cli.main(["status"]) == 1
+    out = capsys.readouterr().out
+    assert op_id in out and "observed" in out and "SetState:closed" in out
+
+    assert cli.main(["reconcile"]) == 1  # nothing more to find automatically: it still needs a person
+    out = capsys.readouterr().out
+    assert f"{op_id}  observed: target state seen, not proven" in out
+    assert service.store.operation(op_id).status == "observed"
+
+    assert cli.main(["resolve", op_id, "done", "https://github.com/acme/field-reports/issues/12"]) == 0
+    capsys.readouterr()
+    assert cli.main(["status"]) == 0
+    assert op_id not in capsys.readouterr().out
+    assert service.store.health()["writes_observed_unproven"] == 0

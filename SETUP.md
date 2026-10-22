@@ -101,8 +101,8 @@ A backup is only readable with the same `GIT_SMS_SECRET_KEY`; store that key sep
 If GitHub times out or fails mid-write, Git SMS never retries it. Run these with the server's environment:
 
 ```bash
-python -m git_sms status      # queue health, and every write not yet settled (exit 1 if any is unknown)
-python -m git_sms reconcile   # look for unknown writes on GitHub and settle those found
+python -m git_sms status      # queue health, and every write not yet settled (exit 1 if any is unknown or observed)
+python -m git_sms reconcile   # look for unknown writes on GitHub; observed ones are listed for you to check
 python -m git_sms resolve OP_ID done https://github.com/owner/repo/issues/7   # or: resolve OP_ID failed
 ```
 

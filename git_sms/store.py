@@ -495,10 +495,11 @@ class Store:
         return Operation(*row) if row else None
 
     def unresolved_operations(self) -> list[Operation]:
+        """Writes an operator may still need to settle, including observed (unproven) state changes."""
         with self._lock:
             rows = self._db.execute(
                 f"SELECT {OPERATION_COLUMNS} FROM operations "  # noqa: S608
-                "WHERE status IN ('confirmed', 'executing', 'unknown') ORDER BY created_at"
+                "WHERE status IN ('confirmed', 'executing', 'unknown', 'observed') ORDER BY created_at"
             ).fetchall()
         return [Operation(*row) for row in rows]
 
@@ -517,7 +518,8 @@ class Store:
             unknown_replies = self._db.execute("SELECT count(*) FROM outbound WHERE status = 'unknown'").fetchone()[0]
             writes = dict(
                 self._db.execute(
-                    "SELECT status, count(*) FROM operations WHERE status IN ('confirmed', 'executing', 'unknown') "
+                    "SELECT status, count(*) FROM operations "
+                    "WHERE status IN ('confirmed', 'executing', 'unknown', 'observed') "
                     "GROUP BY status"
                 ).fetchall()
             )
@@ -530,6 +532,7 @@ class Store:
             "writes_approved_unattempted": writes.get("confirmed", 0),
             "writes_in_progress": writes.get("executing", 0),
             "writes_unknown": writes.get("unknown", 0),
+            "writes_observed_unproven": writes.get("observed", 0),
         }
 
     # Fixed-window limits -------------------------------------------------------------
