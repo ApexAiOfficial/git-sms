@@ -53,9 +53,11 @@ intake** (the message is committed to the queue before Twilio is answered, and r
 **confirmation code** that only the registered handset receives, which production cannot switch off. That last
 step also defeats a spoofed sender number.
 
-Every write is **journalled before it is attempted**, in the same step that accepts its confirmation, so a crash
-or a redelivered message can neither lose a confirmed change nor repeat one. New issues and comments also carry a
-hidden marker that proves later whether they landed. A write GitHub did not confirm is reported as unconfirmed and
+Every write is **durably recorded in the same step that accepts its confirmation**, so a crash cannot silently
+discard an approval, and it is **attempted at most once**, so nothing is ever written twice. Approval is not a
+promise of execution: GitHub may refuse the change, access may have been revoked, or an attempt interrupted by a
+crash ends as *unknown* rather than being repeated. New issues and comments carry a hidden marker that proves
+later whether they landed. A write GitHub did not confirm is reported as unconfirmed and
 never retried blindly. Writes run under a least-privilege **GitHub App** installation token (or a fine-grained
 token) and are attributed to the sender's alias, not their number. Queued messages, replies and pending changes
 are **encrypted at rest** and expire; senders are stored as keyed hashes; every decision is audited. Details:

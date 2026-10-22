@@ -16,7 +16,7 @@ meets them:
 | --- | --- |
 | Forged webhook (anyone can POST to a public URL) | `X-Twilio-Signature` verified with the account auth token against the configured public URL; the `AccountSid` must match. Production refuses to start without these; unsigned ingress needs an explicit, development-only `GIT_SMS_ALLOW_UNSIGNED`. Delivery-status callbacks are verified the same way. |
 | An acknowledged message is lost in a crash | The message is committed (encrypted) to the SQLite intake queue before Twilio receives its 200. Messages interrupted mid-processing are re-queued on restart; one that keeps failing is given up after three attempts. |
-| A crash loses a confirmed change | Accepting the confirmation code and journalling the write as an approved intent are one transaction, so a crash at any later point leaves the intent to be attempted after restart. |
+| A crash silently discards a confirmed change | Accepting the confirmation code and journalling the write as an approved intent are one transaction, so after a crash the approval still exists. It is then attempted if no attempt had started, or reported as unknown if one might have. Durable approval is not guaranteed execution: an approved write can still fail (GitHub refuses it, grants were revoked) or end unknown, and an approval whose message was given up after repeated processing failures stays visible as "approved, not attempted" in `git-sms status` until an operator resolves it. |
 | A redelivered webhook, a crash or a retry repeats a write | Each `MessageSid` is queued once. An approved intent moves to "executing" exactly once, just before GitHub is called, and is never attempted again: re-processing reports the result or reconciles it. New issues and comments carry a hidden `<!-- git-sms:... -->` marker that proves whether they landed. |
 | A write's outcome is unknown (timeout, dropped connection, GitHub 5xx, a crash during the call) | Recorded as `unknown` and never retried automatically. The sender is told to check GitHub first, an identical later request is flagged as a possible duplicate, and operators can see and settle these writes with `git-sms status`, `reconcile` and `resolve`. |
 | Messages or replies out of order | One sender's messages run strictly in arrival order, and their replies are handed to Twilio one at a time in the order written; different senders run in parallel. (Carriers do not guarantee delivery order.) |
@@ -55,8 +55,9 @@ meets them:
   per-user PIN is on the roadmap.
 - Reconciliation looks for the write's marker on GitHub. If someone deletes the issue or edits the marker away,
   the outcome stays `unknown`, which is the safe answer. A state change (`CLOSE`, `REOPEN`) carries no marker:
-  finding the issue in the target state settles the write but is reported as unproven, since someone else may
-  have changed it.
+  finding the issue in the target state records the write as `observed` (never `done`), audits it as
+  `observed_unproven`, and every later reply says GitHub did not confirm this request did it, since someone else
+  may have changed it. Only an operator's `resolve` turns it into `done`.
 - If the process dies after a write was marked "executing" but before GitHub was called, nothing was written but
   the outcome is still reported as unknown. That is the price of never writing twice.
 - Delivery receipts depend on Twilio's status callbacks reaching `GIT_SMS_PUBLIC_URL/twilio/status`.

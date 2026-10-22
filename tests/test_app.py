@@ -594,3 +594,48 @@ def _inbound_for(edge_, message_sid, body):
     from git_sms.service import Inbound
 
     return Inbound(message_sid, ALICE, OUR_NUMBER, body)
+
+
+# Third review ------------------------------------------------------------------------------
+
+
+def test_an_unproven_state_change_stays_uncertain_in_state_audit_and_replies(edge, api, monkeypatch):
+    """P2: finding the issue closed proves nothing about this request, now or on any later replay."""
+    e = edge()
+    e.text("close acme/field-reports#12", sid(1))
+    e.post(form("confirm 4821", sid=sid(2)))
+
+    def die(*args, **kwargs):
+        raise Crash
+
+    monkeypatch.setattr(e.service.github, "set_state", die)
+    with pytest.raises(Crash):
+        e.worker.drain()
+    api.add("GET", "/repos/acme/field-reports/issues/12", {**ISSUE_12_CLOSED})  # someone else closed it meanwhile
+    fresh = e.restart()
+    fresh.worker.store.recover()
+    fresh.worker.drain()
+    op_id = fresh.service.store.op_id(sid(2))
+    unproven = "acme/field-reports#12 is closed now, but GitHub did not confirm whether this request did it"
+    assert fresh.sender.sent[-1][2].startswith(unproven)
+    assert fresh.service.store.operation(op_id).status == "observed"
+    assert any(entry.outcome == "observed_unproven" for entry in fresh.service.store.audit_log())
+    replay = fresh.service.handle(_inbound_for(fresh, sid(2), "confirm 4821"))
+    assert replay[0].startswith(unproven) and not replay[0].startswith("Already done")
+    assert api.calls("PATCH") == []
+
+
+def test_a_full_queue_still_acknowledges_a_redelivery(edge):
+    e = edge(max_queued=1)
+    assert e.post(form("whoami", sid=sid(1))).status_code == 200
+    assert e.post(form("whoami", sid=sid(2))).status_code == 503
+    assert e.post(form("whoami", sid=sid(1))).status_code == 200  # Twilio retrying something we already hold
+
+
+ISSUE_12_CLOSED = {
+    "number": 12,
+    "title": "Pump 3 leaks",
+    "state": "closed",
+    "user": {"login": "maria"},
+    "html_url": "https://github.com/acme/field-reports/issues/12",
+}

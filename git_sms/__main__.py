@@ -4,6 +4,7 @@
     python -m git_sms status                queue, reply and write health, and every unsettled write
     python -m git_sms reconcile             look for unsettled writes on GitHub and settle those found
     python -m git_sms resolve OP done URL   record an operator's verdict on one write after checking GitHub
+                                            (unknown, observed, or an approved write that was never attempted)
     python -m git_sms resolve OP failed
 
 `status` and `resolve` only read and write the database; `reconcile` also reads GitHub.
@@ -52,8 +53,10 @@ def reconcile() -> int:
         if op.status != "unknown":
             continue  # confirmed and executing writes belong to the running server
         found = service.reconcile(op)
-        if found:
-            print(f"{op.op_id}  done ({'proven by marker' if found[1] else 'target state only'})  {found[0]}")
+        if found and found[1]:
+            print(f"{op.op_id}  done (proven by marker)  {found[0]}")
+        elif found:
+            print(f"{op.op_id}  observed (target state only; resolve it once you have checked)  {found[0]}")
         else:
             remaining += 1
             print(f"{op.op_id}  still unknown: check {service.github.web_url(op.repo + '/issues')} and run resolve")
@@ -63,7 +66,7 @@ def reconcile() -> int:
 def resolve(op_id: str, verdict: str, url: str | None) -> int:
     service = _service()
     op = service.store.operation(op_id)
-    if op is None or op.status not in {"unknown", "executing"}:
+    if op is None or op.status not in {"unknown", "executing", "observed", "confirmed"}:
         print(f"{op_id}: no unsettled write with that id", file=sys.stderr)
         return 2
     service.store.finish_operation(op_id, verdict, url)
