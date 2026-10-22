@@ -53,12 +53,13 @@ intake** (the message is committed to the queue before Twilio is answered, and r
 **confirmation code** that only the registered handset receives, which production cannot switch off. That last
 step also defeats a spoofed sender number.
 
-Writes are **journalled and marked**, so a crash or a redelivered message can never repeat one, and a write
-GitHub did not confirm is reported as unconfirmed and never retried blindly. They run under a least-privilege
-**GitHub App** installation token (or a fine-grained token) and are attributed to the sender's alias, not their
-number. Queued messages, replies and pending changes are **encrypted at rest** and expire; senders are stored as
-keyed hashes; every decision is audited. Details: [SECURITY.md](SECURITY.md) and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Every write is **journalled before it is attempted**, in the same step that accepts its confirmation, so a crash
+or a redelivered message can neither lose a confirmed change nor repeat one. New issues and comments also carry a
+hidden marker that proves later whether they landed. A write GitHub did not confirm is reported as unconfirmed and
+never retried blindly. Writes run under a least-privilege **GitHub App** installation token (or a fine-grained
+token) and are attributed to the sender's alias, not their number. Queued messages, replies and pending changes
+are **encrypted at rest** and expire; senders are stored as keyed hashes; every decision is audited. Details:
+[SECURITY.md](SECURITY.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Getting started
 
@@ -73,7 +74,8 @@ GitHub repository with simulated (correctly signed) Twilio traffic; no carrier-d
 - **Done (0.2):** authenticated webhook edge with a durable queue and crash recovery, sender directory and grants,
   confirmed issue/comment/close/reopen with a write journal, deterministic read commands, SMS-aware paging,
   delivery-status tracking, retention, optional AI summaries and natural-language routing under a daily budget,
-  an audit log, 283 automated tests, and live end-to-end and crash-recovery harnesses against a real repository.
+  an audit log, operator commands and a readiness probe, 307 automated tests, and live end-to-end and
+  crash-recovery harnesses against a real repository.
 - **Next:** carrier-delivered verification on a registered sender (toll-free verification or A2P 10DLC), a
   GitHub App setup helper, an audit export command, optional per-user PINs.
 - **Then:** allowlisted `workflow_dispatch` (`RUN deploy staging`) with run tracking, SMS notifications for

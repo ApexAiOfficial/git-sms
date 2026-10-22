@@ -19,7 +19,8 @@ controllable, and webhooks carry real signatures computed with the Twilio SDK. T
   sender, grants re-checked), limits, opt-outs, guests, paging, summaries and natural-language safety;
 - the HTTP edge and worker: forged, unsigned, tampered, wrong-URL and wrong-account webhooks are rejected before
   queueing; redelivery is processed once; each crash window (after the 200, mid-processing, after the GitHub
-  write, mid-write with and without evidence on GitHub) recovers without loss or a repeated write; transient,
+  write, mid-write with and without evidence on GitHub, and by fault injection right after the confirmation is
+  accepted and right after the attempt starts) recovers without loss or a repeated write; transient,
   permanent and ambiguous send failures are handled distinctly; status callbacks are verified; Advanced Opt-Out
   messages are never answered.
 
