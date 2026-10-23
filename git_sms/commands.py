@@ -178,6 +178,7 @@ ALIASES = {
     "discard": "abort",
     "nevermind": "abort",
     "create": "new",
+    "open": "new",  # OPEN ISSUE ... reads naturally; it still needs the confirmation code
 }
 
 

@@ -8,6 +8,8 @@ authorisation and (for writes) mandatory confirmation.
 
 from __future__ import annotations
 
+import re
+
 import httpx
 
 SUMMARY_SYSTEM = (
@@ -24,7 +26,15 @@ SUMMARIZE owner/repo ISSUE | NEW ISSUE owner/repo Title -- details
 COMMENT owner/repo#N text | CLOSE owner/repo#N | REOPEN owner/repo#N | USE owner/repo
 Omit owner/repo only if the message clearly relies on the sender's default repository.
 Never guess a repository name: if it is unclear, use SEARCH with the words given.
-Reply with the single command line and nothing else, or NONE."""
+Reply with the single command line and nothing else, or NONE.
+Examples:
+what is open in acme/app? => ISSUES acme/app open
+please open an issue in acme/app titled Login is broken => NEW ISSUE acme/app Login is broken
+file a bug in acme/app: the pump stops, it started today => NEW ISSUE acme/app The pump stops -- it started today
+tell acme/app#4 that the fix works => COMMENT acme/app#4 The fix works
+approve it => NONE
+tell me a joke => NONE"""
+LABEL = re.compile(r"^(?:command|output|answer|result)\s*[:=>-]+\s*", re.IGNORECASE)
 
 
 class LLMError(Exception):
@@ -80,6 +90,15 @@ class LLM:
         return self.complete(SUMMARY_SYSTEM, f"Summarise this {kind}.\n<content>\n{content}\n</content>")
 
     def interpret(self, text: str) -> str | None:
-        line = self.complete(INTERPRET_SYSTEM, text[:500], max_tokens=120, temperature=0.0)
-        line = line.strip().strip("`").strip().splitlines()[0].strip() if line.strip() else ""
-        return None if not line or line.upper() == "NONE" else line
+        return normalize_interpretation(self.complete(INTERPRET_SYSTEM, text[:500], max_tokens=120, temperature=0.0))
+
+
+def normalize_interpretation(raw: str) -> str | None:
+    """The first command-looking line of a model reply, without fences, quotes or labels."""
+    for line in raw.replace("```", "\n").splitlines():
+        line = LABEL.sub("", line.strip().strip("`").strip()).strip().strip("\"'").strip()
+        line = line.lstrip("=>-:* ").strip()  # an echoed "=>" from the examples; commands start with a letter
+        if line.lower() in {"", "text", "sms", "plaintext"}:
+            continue
+        return None if line.upper().rstrip(".") == "NONE" else line
+    return None
