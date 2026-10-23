@@ -151,16 +151,37 @@ The final acceptance review of `d7ed1e6` approved merging as a development found
 observed (unproven) state changes were missing from `git-sms status` and the health counts. Fixed in `89c342a`
 with a regression that fails on `d7ed1e6`. Merged to `main` as `3e7ebb6` on 2026-10-22.
 
+## Can an Android handset be the SMS gateway?
+
+Yes, for small deployments: `e2e/live_sms_e2e.py --path android` ran the unchanged Git SMS core with a handset as
+its only SMS link and passed over real carrier SMS. A product transport would need, beyond the harness:
+
+- **Inbound by polling.** The gate is polled every few seconds; Termux:API has no push to a remote server unless
+  the phone can reach it (for example Termux:Tasker on new SMS plus a tunnel). Polling is what made it simple and
+  safe: the server initiates every call, through a key that can do nothing but the gate.
+- **No delivery receipts.** `termux-sms-send` reports nothing after handing the message to Android, so replies
+  are "sent", never "delivered".
+- **An awake, dedicated phone.** Android's battery management can stop Termux or its SSH server; a gateway phone
+  needs to stay powered, on the network and exempt from battery optimisation. A personal phone is fine for
+  supervised tests, not as infrastructure.
+- **Carrier terms.** Consumer plans are meant for person-to-person messaging; sustained application traffic can be
+  filtered or breach the plan's terms. Registered A2P senders (as with Twilio) exist for that reason.
+- **The same security model applies.** Sender numbers come from the carrier; the confirmation code still guards
+  every write; the gate keeps everything else on the phone private.
+
+That makes it a credible option for a community without an SMS-provider account (one phone, a few users), and the
+roadmap keeps it as an optional transport rather than a replacement for a registered sender.
+
 ## Roadmap
 
-Validation milestones come first; none has been done yet:
+Validation status:
 
-1. **Carrier-delivered SMS.** A dedicated sender with toll-free verification or A2P 10DLC registration, and a
-   recorded run in both directions from a real handset, with Twilio's message log and delivery callbacks as
-   independent evidence.
-2. **A real GitHub App.** Install the least-privilege App described in SETUP.md on a test repository and observe
-   every write, including whether commenting on a pull request needs more than the Issues permission.
-3. **A live AI provider.** Exercise summaries and free-form routing against an OpenAI-compatible endpoint.
+1. **Carrier-delivered SMS.** Done in both directions over an Android gateway and over a Twilio number (see
+   docs/TESTING.md). Remaining: a dedicated Twilio number with its own A2P 10DLC or toll-free registration, so
+   that Twilio calls Git SMS's webhook with carrier traffic.
+2. **A real GitHub App.** Not done: install the least-privilege App described in SETUP.md on a test repository and
+   observe every write, including whether commenting on a pull request needs more than the Issues permission.
+3. **A live AI provider.** Done against DeepSeek through the OpenAI-compatible protocol.
 
 Then:
 
@@ -168,5 +189,5 @@ Then:
    for writes.
 5. **Automation.** Allowlisted `workflow_dispatch` (`RUN deploy staging`) with per-user grants, confirmation, and
    run-status follow-up by SMS; subscriptions that text watched issue and pull-request updates.
-6. **Reach.** Localised replies, and an optional Android SMS-gateway transport for communities that have a phone
-   and a data connection but no SMS provider account.
+6. **Reach.** Localised replies, and the Android SMS-gateway transport as a supported option for communities that
+   have a phone and a data connection but no SMS provider account.
