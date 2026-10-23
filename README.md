@@ -70,18 +70,19 @@ serve HTTPS. A [Dockerfile](Dockerfile) is included.
 
 ## Status and roadmap
 
-**Status: development foundation (0.2), not yet carrier-validated.** Everything below is tested against a real
-GitHub repository with simulated (correctly signed) Twilio traffic; no carrier-delivered SMS has been tested yet.
+**Status: development foundation (0.2).** Carrier-delivered SMS has now been tested in both directions over two
+transports (an Android handset as the SMS gateway, and a Twilio number), with a live AI provider, against a real
+GitHub repository. Not yet tested: Twilio calling Git SMS's own webhook with a carrier message (it needs a
+dedicated, registered number) and a real GitHub App installation. See [docs/TESTING.md](docs/TESTING.md).
 
 - **Done (0.2):** authenticated webhook edge with a durable queue and crash recovery, sender directory and grants,
   confirmed issue/comment/close/reopen with a write journal, deterministic read commands, SMS-aware paging,
   delivery-status tracking, retention, optional AI summaries and natural-language routing under a daily budget,
-  an audit log, operator commands and a readiness probe, 312 automated tests, and live end-to-end and
-  crash-recovery harnesses against a real repository.
-- **Next (validation milestones):** carrier-delivered SMS in both directions on a registered sender (toll-free
-  verification or A2P 10DLC); a real least-privilege GitHub App installation, including whether pull-request
-  comments need more than Issues permission; and a live OpenAI-compatible AI provider. Then a GitHub App setup
-  helper, an audit export command, optional per-user PINs.
+  an audit log, operator commands and a readiness probe, 346 automated tests, and live end-to-end, crash-recovery,
+  carrier-SMS and AI harnesses.
+- **Next:** a dedicated Twilio number with A2P 10DLC or toll-free registration so the webhook leg runs on carrier
+  traffic; a real least-privilege GitHub App (including whether pull-request comments need more than Issues
+  permission); then a GitHub App setup helper, an audit export command, optional per-user PINs.
 - **Then:** allowlisted `workflow_dispatch` (`RUN deploy staging`) with run tracking, SMS notifications for
   watched issues, and an optional Android SMS-gateway transport for deployments without an SMS provider.
 
